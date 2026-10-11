@@ -1,0 +1,13 @@
+/.venv/
+/.tmp/
+/.pytest-tmp*/
+/.pytest_cache/
+/data/
+/dist/
+/build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+
