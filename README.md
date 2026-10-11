@@ -74,8 +74,8 @@ The local environment resolved NumPy 2.5.4 and SciPy 1.18.1. Optional GPU packag
 
 1. Create a ZIP of the current project worktree without `.venv`, `data`, or `artifacts`.
 2. Open `notebooks/RouteTune_Colab.ipynb` in Google Colab and select a T4-or-better GPU runtime.
-3. Run each cell in order, upload that ZIP, permit the Google Drive mount, and retain the printed run path.
-4. The notebook installs the exact `.[gpu,test]` lock, checks installed APIs and CUDA, runs all CPU tests, downloads and fingerprints BANKING77, creates a fresh `PREPARED` run, then executes Gates B-D.
+3. Start with a fresh runtime. Run through the dependency-install cell, allow its mandatory process restart, reconnect, and continue at **Post-restart verification**; do not reload or monkey-patch Transformers modules.
+4. The notebook force-installs the exact `.[gpu,test]` lock, runs `pip check`, verifies package/runtime identity and supported APIs after restart, checks CUDA, runs all CPU tests, downloads and fingerprints BANKING77, creates a fresh `PREPARED` run, then executes Gates B-D.
 5. Return the exported run ZIP. Do not enable `RUN_FINAL_HELDOUT` until the manifest is `VERIFIED` and the Gate B-D evidence has been reviewed.
 
 The current lock is `torch 2.14.1`, `transformers 5.19.0`, `trl 1.15.0`, `peft 0.21.2`, `accelerate 1.15.0`, `bitsandbytes 0.50.2`, and `datasets 4.7.0`. These are a reproducible target, not locally verified GPU evidence; the notebook checks the required installed APIs before model loading.

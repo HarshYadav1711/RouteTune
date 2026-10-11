@@ -93,6 +93,15 @@ GPU_PACKAGES = (
     "datasets",
     "scikit-learn",
 )
+PINNED_GPU_PACKAGE_VERSIONS = {
+    "accelerate": "1.15.0",
+    "bitsandbytes": "0.50.2",
+    "datasets": "4.7.0",
+    "peft": "0.21.2",
+    "torch": "2.14.1",
+    "transformers": "5.19.0",
+    "trl": "1.15.0",
+}
 
 
 def validate_qlora_config(config: QLoRAConfig) -> None:
@@ -253,13 +262,52 @@ def environment_report() -> dict[str, Any]:
     return report
 
 
-def verify_training_apis() -> None:
+def verify_pinned_gpu_dependencies() -> None:
+    mismatches = []
+    for package, expected in PINNED_GPU_PACKAGE_VERSIONS.items():
+        try:
+            actual = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            actual = "not installed"
+        if actual.split("+", 1)[0] != expected:
+            mismatches.append(f"{package}={actual} (expected {expected})")
+    if mismatches:
+        raise TrainingError(f"installed GPU dependency lock differs: {', '.join(mismatches)}")
+
+
+def verify_transformers_runtime(transformers: Any) -> None:
+    installed = importlib.metadata.version("transformers")
+    if getattr(transformers, "__version__", None) != installed:
+        raise TrainingError(
+            f"mixed Transformers runtime: imported {getattr(transformers, '__version__', None)!r}, "
+            f"installed {installed!r}; restart the runtime after installation"
+        )
+    auto_config = getattr(transformers, "AutoConfig", None)
+    pretrained_config = getattr(transformers, "PreTrainedConfig", None)
+    if not callable(getattr(auto_config, "from_pretrained", None)) or not callable(
+        getattr(pretrained_config, "get_config_dict", None)
+    ):
+        raise TrainingError("installed Transformers configuration APIs are incompatible")
     try:
+        injected_revision = getattr(pretrained_config(), "_commit_hash", None)
+    except Exception as exc:
+        raise TrainingError(f"Transformers configuration initialization is incompatible: {exc}") from exc
+    if injected_revision is not None:
+        raise TrainingError(
+            "Transformers PreTrainedConfig injects _commit_hash; use an unmodified runtime"
+        )
+
+
+def verify_training_apis() -> None:
+    verify_pinned_gpu_dependencies()
+    try:
+        import transformers
         from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
         from trl import SFTConfig, SFTTrainer
     except ImportError as exc:
         raise TrainingError(f"GPU dependency is unavailable: {exc}") from exc
+    verify_transformers_runtime(transformers)
     required_sft_config = {
         "completion_only_loss",
         "dataset_kwargs",
@@ -281,6 +329,7 @@ def verify_training_apis() -> None:
             PeftModel.from_pretrained,
             get_peft_model,
             prepare_model_for_kbit_training,
+            AutoConfig.from_pretrained,
             AutoTokenizer.from_pretrained,
             AutoModelForCausalLM.from_pretrained,
             BitsAndBytesConfig,
@@ -363,9 +412,16 @@ def _load_quantized_base(revision: str) -> tuple[Any, Any, str]:
     if not is_immutable_model_revision(revision):
         raise TrainingError("model revision must be a full 40-character hexadecimal SHA")
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, revision=revision)
+    try:
+        config = AutoConfig.from_pretrained(MODEL_ID, revision=revision)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, revision=revision)
+    except Exception as exc:
+        raise TrainingError(
+            f"base-model configuration/tokenizer load failed at immutable revision {revision}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -378,6 +434,7 @@ def _load_quantized_base(revision: str) -> tuple[Any, Any, str]:
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         revision=revision,
+        config=config,
         device_map={"": 0},
         quantization_config=quantization,
         torch_dtype=torch.float16,
@@ -582,10 +639,6 @@ def assert_identical_order(*groups: Iterable[PredictionRecord]) -> None:
 def execute_phase3_training(run_dir: Path, cache_dir: Path) -> Path:
     """Execute Gates B-D. Official held-out data is not evaluated here."""
 
-    import torch
-    from datasets import Dataset
-    from trl import SFTConfig, SFTTrainer
-
     validate_qlora_config(FIXED_QLORA_CONFIG)
     manifest = load_manifest(run_dir)
     if manifest["state"] != "PREPARED":
@@ -594,6 +647,10 @@ def execute_phase3_training(run_dir: Path, cache_dir: Path) -> Path:
     if manifest["fingerprints"] != fingerprints:
         raise TrainingError("run fingerprints do not match the current locked data")
     environment = verify_gpu_environment()
+    import torch
+    from datasets import Dataset
+    from trl import SFTConfig, SFTTrainer
+
     torch.manual_seed(FIXED_QLORA_CONFIG.seed)
     torch.cuda.manual_seed_all(FIXED_QLORA_CONFIG.seed)
     update_run(run_dir, state="RUNNING", environment=environment)

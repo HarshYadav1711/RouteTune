@@ -1,5 +1,6 @@
 from dataclasses import replace
 import json
+from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -11,6 +12,7 @@ from routetune.evaluation import prediction_record
 from routetune.experiment import create_run, update_run
 from routetune.training import (
     FIXED_QLORA_CONFIG,
+    PINNED_GPU_PACKAGE_VERSIONS,
     TrainingError,
     _load_quantized_base,
     _load_recorded_quantized_base,
@@ -25,6 +27,8 @@ from routetune.training import (
     verify_gpu_environment,
     verify_evaluation_artifact,
     verify_masked_batch,
+    verify_pinned_gpu_dependencies,
+    verify_transformers_runtime,
 )
 
 
@@ -136,6 +140,43 @@ def test_dependency_failure_is_clear_without_touching_gpu(monkeypatch):
         verify_gpu_environment()
 
 
+def test_pinned_gpu_dependency_versions_are_enforced(monkeypatch):
+    installed = dict(PINNED_GPU_PACKAGE_VERSIONS)
+    monkeypatch.setattr(
+        "routetune.training.importlib.metadata.version", lambda package: installed[package]
+    )
+    verify_pinned_gpu_dependencies()
+
+    installed["transformers"] = "5.18.0"
+    with pytest.raises(TrainingError, match="transformers=5.18.0.*expected 5.19.0"):
+        verify_pinned_gpu_dependencies()
+
+
+def test_transformers_runtime_rejects_mixed_install(monkeypatch):
+    transformers = SimpleNamespace(__version__="5.18.0")
+    monkeypatch.setattr("routetune.training.importlib.metadata.version", lambda _: "5.19.0")
+    with pytest.raises(TrainingError, match="mixed Transformers runtime"):
+        verify_transformers_runtime(transformers)
+
+
+def test_transformers_runtime_rejects_mutable_revision_patch(monkeypatch):
+    class AutoConfig:
+        from_pretrained = staticmethod(lambda *_args, **_kwargs: None)
+
+    class PreTrainedConfig:
+        get_config_dict = staticmethod(lambda *_args, **_kwargs: ({}, {}))
+
+        def __init__(self):
+            self._commit_hash = "main"
+
+    transformers = SimpleNamespace(
+        __version__="5.19.0", AutoConfig=AutoConfig, PreTrainedConfig=PreTrainedConfig
+    )
+    monkeypatch.setattr("routetune.training.importlib.metadata.version", lambda _: "5.19.0")
+    with pytest.raises(TrainingError, match="injects _commit_hash"):
+        verify_transformers_runtime(transformers)
+
+
 class FakeHubApi:
     def __init__(self, result=None, error=None):
         self.result = result
@@ -193,6 +234,13 @@ def test_quantized_model_and_tokenizer_use_same_immutable_revision(monkeypatch):
     torch = ModuleType("torch")
     torch.float16 = object()
     transformers = ModuleType("transformers")
+    config = SimpleNamespace(model_type="qwen2")
+
+    class AutoConfig:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            calls.append(("config", model_id, kwargs))
+            return config
 
     class AutoTokenizer:
         @staticmethod
@@ -217,6 +265,7 @@ def test_quantized_model_and_tokenizer_use_same_immutable_revision(monkeypatch):
             self.kwargs = kwargs
 
     transformers.AutoTokenizer = AutoTokenizer
+    transformers.AutoConfig = AutoConfig
     transformers.AutoModelForCausalLM = AutoModelForCausalLM
     transformers.BitsAndBytesConfig = BitsAndBytesConfig
     monkeypatch.setitem(sys.modules, "torch", torch)
@@ -224,7 +273,13 @@ def test_quantized_model_and_tokenizer_use_same_immutable_revision(monkeypatch):
 
     _, _, revision = _load_quantized_base(MODEL_SHA)
     assert revision == MODEL_SHA
-    assert [call[2]["revision"] for call in calls] == [MODEL_SHA, MODEL_SHA]
+    assert [call[2]["revision"] for call in calls] == [MODEL_SHA, MODEL_SHA, MODEL_SHA]
+    assert calls[-1][2]["config"] is config
+
+
+def test_quantized_model_load_rejects_mutable_revision_before_dependencies():
+    with pytest.raises(TrainingError, match="full 40-character hexadecimal SHA"):
+        _load_quantized_base("main")
 
 
 def test_saved_adapter_reload_uses_manifest_revision(monkeypatch, tmp_path):
@@ -244,6 +299,20 @@ def test_saved_adapter_reload_uses_manifest_revision(monkeypatch, tmp_path):
     monkeypatch.setattr("routetune.training._load_quantized_base", fake_load)
     assert _load_recorded_quantized_base(run) == ("tokenizer", "model", MODEL_SHA)
     assert captured == [MODEL_SHA]
+
+
+def test_colab_workflow_forces_clean_restart_without_transformers_patches():
+    notebook = json.loads(
+        (Path(__file__).parents[1] / "notebooks" / "RouteTune_Colab.ipynb").read_text(
+            encoding="utf-8"
+        )
+    )
+    source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
+    assert "--force-reinstall" in source
+    assert "os.kill(os.getpid(), signal.SIGKILL)" in source
+    assert "verify_gpu_environment" in source
+    assert "PreTrainedConfig.__init__" not in source
+    assert '_commit_hash = "main"' not in source
 
 
 def test_evaluation_conditions_must_keep_identical_order():
