@@ -1,6 +1,8 @@
 from collections import UserDict
 from dataclasses import replace
+import importlib.metadata
 import json
+import math
 from pathlib import Path
 import sys
 import tomllib
@@ -24,6 +26,7 @@ from routetune.training import (
     assess_pip_check,
     adapter_parameter_evidence,
     assert_identical_order,
+    build_sft_config,
     execute_phase3_training,
     pad_tokenized_batch,
     prompt_completion,
@@ -60,6 +63,7 @@ def _mock_phase3_until_smoke(
     monkeypatch.setattr(
         "routetune.training.verify_gpu_environment", lambda: {"cuda": True}
     )
+    monkeypatch.setattr("routetune.training.build_sft_config", lambda *_args: object())
     monkeypatch.setattr("routetune.training.resolve_model_revision", lambda: MODEL_SHA)
 
     torch = ModuleType("torch")
@@ -224,6 +228,94 @@ def test_frozen_model_configuration_cannot_drift():
         validate_qlora_config(replace(FIXED_QLORA_CONFIG, lora_rank=16))
 
 
+class RecordingSFTConfig:
+    last_kwargs = None
+
+    def __init__(self, **kwargs):
+        type(self).last_kwargs = kwargs
+        for name, value in kwargs.items():
+            setattr(self, name, [] if name == "report_to" and value == "none" else value)
+
+    def get_warmup_steps(self, total_steps):
+        return math.ceil(total_steps * self.warmup_steps)
+
+
+def test_sft_config_uses_supported_warmup_fraction_and_frozen_settings(tmp_path):
+    config = build_sft_config(RecordingSFTConfig, tmp_path / "trainer")
+    kwargs = RecordingSFTConfig.last_kwargs
+
+    assert "warmup_ratio" not in kwargs
+    assert kwargs["warmup_steps"] == 0.1
+    assert config.get_warmup_steps(100) == 10
+    assert kwargs == {
+        "output_dir": str(tmp_path / "trainer"),
+        "num_train_epochs": 2,
+        "learning_rate": 1.5e-4,
+        "lr_scheduler_type": "cosine",
+        "warmup_steps": 0.1,
+        "per_device_train_batch_size": 4,
+        "gradient_accumulation_steps": 4,
+        "per_device_eval_batch_size": 8,
+        "max_length": 256,
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        "fp16": True,
+        "logging_steps": 10,
+        "logging_strategy": "steps",
+        "eval_strategy": "epoch",
+        "save_strategy": "no",
+        "report_to": "none",
+        "seed": 42,
+        "data_seed": 42,
+        "remove_unused_columns": False,
+        "completion_only_loss": True,
+        "dataset_kwargs": {"skip_prepare_dataset": True},
+    }
+    assert kwargs["per_device_train_batch_size"] * kwargs["gradient_accumulation_steps"] == 16
+
+
+def test_sft_config_rejects_unsupported_or_invalid_configuration(tmp_path):
+    class UnsupportedSFTConfig:
+        def __init__(self, output_dir):
+            self.output_dir = output_dir
+
+    with pytest.raises(TrainingError, match="does not support RouteTune arguments"):
+        build_sft_config(UnsupportedSFTConfig, tmp_path)
+
+    class InvalidSFTConfig:
+        def __init__(self, **_kwargs):
+            raise TypeError("invalid training configuration")
+
+    with pytest.raises(
+        TrainingError,
+        match="SFTConfig preflight failed: TypeError: invalid training configuration",
+    ):
+        build_sft_config(InvalidSFTConfig, tmp_path)
+
+
+def test_sft_config_rejects_non_fractional_warmup_interpretation(tmp_path):
+    class InvalidWarmupSFTConfig(RecordingSFTConfig):
+        def get_warmup_steps(self, _total_steps):
+            return 0
+
+    with pytest.raises(TrainingError, match="warmup_steps=0.1.*10% fraction"):
+        build_sft_config(InvalidWarmupSFTConfig, tmp_path)
+
+
+def test_pinned_real_sft_config_preflight_when_available(tmp_path):
+    trl = pytest.importorskip("trl")
+    pytest.importorskip("transformers")
+    if any(
+        importlib.metadata.version(package) != PINNED_GPU_PACKAGE_VERSIONS[package]
+        for package in ("trl", "transformers")
+    ):
+        pytest.skip("real-library preflight requires the pinned TRL/Transformers stack")
+
+    config = build_sft_config(trl.SFTConfig, tmp_path / "trainer")
+    assert config.warmup_steps == 0.1
+    assert config.get_warmup_steps(100) == 10
+
+
 class Parameter:
     def __init__(self, size, requires_grad):
         self.size = size
@@ -252,6 +344,27 @@ def test_adapter_parameter_accounting_requires_only_lora_trainables():
     assert evidence["trainable_parameters"] == 10
     assert evidence["total_parameters"] == 1010
     assert evidence["base_parameters_frozen"] is True
+
+
+def test_sft_config_preflight_blocks_model_loading(monkeypatch, tmp_path):
+    run = _mock_phase3_until_smoke(monkeypatch, tmp_path)
+    model_loaded = False
+
+    def fail_preflight(*_args):
+        raise TrainingError("incompatible SFTConfig")
+
+    def load_model(_revision):
+        nonlocal model_loaded
+        model_loaded = True
+
+    monkeypatch.setattr("routetune.training.build_sft_config", fail_preflight)
+    monkeypatch.setattr("routetune.training._load_quantized_base", load_model)
+
+    with pytest.raises(TrainingError, match="incompatible SFTConfig"):
+        execute_phase3_training(run, tmp_path / "cache")
+
+    assert model_loaded is False
+    assert load_manifest(run)["state"] == "PREPARED"
 
 
 @pytest.mark.parametrize(

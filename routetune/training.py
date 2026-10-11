@@ -434,6 +434,72 @@ def verify_transformers_runtime(transformers: Any) -> None:
         )
 
 
+def build_sft_config(config_type: Any, output_dir: Path | str) -> Any:
+    """Build and verify the frozen trainer configuration before expensive GPU work."""
+
+    settings = {
+        "output_dir": str(output_dir),
+        "num_train_epochs": FIXED_QLORA_CONFIG.epochs,
+        "learning_rate": FIXED_QLORA_CONFIG.learning_rate,
+        "lr_scheduler_type": FIXED_QLORA_CONFIG.scheduler,
+        "warmup_steps": FIXED_QLORA_CONFIG.warmup_ratio,
+        "per_device_train_batch_size": FIXED_QLORA_CONFIG.train_batch_size,
+        "gradient_accumulation_steps": FIXED_QLORA_CONFIG.gradient_accumulation_steps,
+        "per_device_eval_batch_size": FIXED_QLORA_CONFIG.eval_batch_size,
+        "max_length": FIXED_QLORA_CONFIG.max_sequence_length,
+        "gradient_checkpointing": FIXED_QLORA_CONFIG.gradient_checkpointing,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        "fp16": FIXED_QLORA_CONFIG.fp16,
+        "logging_steps": FIXED_QLORA_CONFIG.logging_steps,
+        "logging_strategy": "steps",
+        "eval_strategy": "epoch",
+        "save_strategy": "no",
+        "report_to": "none",
+        "seed": FIXED_QLORA_CONFIG.seed,
+        "data_seed": FIXED_QLORA_CONFIG.seed,
+        "remove_unused_columns": False,
+        "completion_only_loss": True,
+        "dataset_kwargs": {"skip_prepare_dataset": True},
+    }
+    try:
+        parameters = inspect.signature(config_type).parameters
+    except (TypeError, ValueError) as exc:
+        raise TrainingError(f"cannot inspect installed TRL SFTConfig: {exc}") from exc
+    accepts_keywords = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    unsupported = sorted(set(settings) - set(parameters)) if not accepts_keywords else []
+    if unsupported:
+        raise TrainingError(
+            f"installed TRL SFTConfig does not support RouteTune arguments: {unsupported}"
+        )
+    try:
+        config = config_type(**settings)
+    except Exception as exc:
+        raise TrainingError(
+            f"TRL SFTConfig preflight failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    expected = {key: value for key, value in settings.items() if key != "output_dir"}
+    expected["report_to"] = []
+    for name, intended in expected.items():
+        actual = getattr(config, name, None)
+        actual = getattr(actual, "value", actual)
+        if name == "report_to" and actual == "none":
+            actual = []
+        if actual != intended:
+            raise TrainingError(
+                f"TRL SFTConfig changed {name}: expected {intended!r}, got {actual!r}"
+            )
+    get_warmup_steps = getattr(config, "get_warmup_steps", None)
+    if not callable(get_warmup_steps) or get_warmup_steps(100) != 10:
+        raise TrainingError(
+            "TRL SFTConfig does not interpret warmup_steps=0.1 as a 10% fraction"
+        )
+    return config
+
+
 def verify_training_apis() -> None:
     verify_pinned_gpu_dependencies()
     try:
@@ -447,20 +513,17 @@ def verify_training_apis() -> None:
         raise TrainingError(f"GPU dependency is unavailable: {exc}") from exc
     verify_torch_runtime(torch, torchvision)
     verify_transformers_runtime(transformers)
-    required_sft_config = {
-        "completion_only_loss",
-        "dataset_kwargs",
-        "eval_strategy",
-        "gradient_checkpointing",
-        "max_length",
-    }
-    config_parameters = set(inspect.signature(SFTConfig).parameters)
     trainer_parameters = set(inspect.signature(SFTTrainer).parameters)
-    if not required_sft_config.issubset(config_parameters):
-        missing = sorted(required_sft_config - config_parameters)
-        raise TrainingError(f"installed TRL SFTConfig lacks required APIs: {missing}")
-    if not {"processing_class", "data_collator", "train_dataset", "eval_dataset"}.issubset(trainer_parameters):
+    if not {
+        "model",
+        "args",
+        "processing_class",
+        "data_collator",
+        "train_dataset",
+        "eval_dataset",
+    }.issubset(trainer_parameters):
         raise TrainingError("installed TRL SFTTrainer lacks required dataset/collator APIs")
+    build_sft_config(SFTConfig, "trainer-output-preflight")
     if not all(
         callable(value)
         for value in (
@@ -790,6 +853,7 @@ def execute_phase3_training(run_dir: Path, cache_dir: Path) -> Path:
     from datasets import Dataset
     from trl import SFTConfig, SFTTrainer
 
+    arguments = build_sft_config(SFTConfig, run_dir / "trainer-output")
     torch.manual_seed(FIXED_QLORA_CONFIG.seed)
     torch.cuda.manual_seed_all(FIXED_QLORA_CONFIG.seed)
     update_run(run_dir, state="RUNNING", environment=environment)
@@ -833,30 +897,6 @@ def execute_phase3_training(run_dir: Path, cache_dir: Path) -> Path:
             },
         )
 
-        arguments = SFTConfig(
-            output_dir=str(run_dir / "trainer-output"),
-            num_train_epochs=2,
-            learning_rate=1.5e-4,
-            lr_scheduler_type="cosine",
-            warmup_ratio=0.1,
-            per_device_train_batch_size=4,
-            gradient_accumulation_steps=4,
-            per_device_eval_batch_size=8,
-            max_length=256,
-            gradient_checkpointing=True,
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-            fp16=True,
-            logging_steps=10,
-            logging_strategy="steps",
-            eval_strategy="epoch",
-            save_strategy="no",
-            report_to="none",
-            seed=42,
-            data_seed=42,
-            remove_unused_columns=False,
-            completion_only_loss=True,
-            dataset_kwargs={"skip_prepare_dataset": True},
-        )
         trainer = SFTTrainer(
             model=model,
             args=arguments,
