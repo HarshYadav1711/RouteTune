@@ -5,11 +5,13 @@ The experiment contract in `docs/EXPERIMENT_PROTOCOL.md` is authoritative. Keep 
 ## Phase boundaries
 
 - Phase 1: package/config, validated data ingestion and cache, deterministic balanced splits, provenance, diagnostics, CPU-only tests, and documentation.
-- Phase 2: evaluation engine and baselines. Do not begin until Phase 1 is reviewed.
+- Phase 2: strict evaluation engine, validation-only classical baseline, frozen Qwen inference contract, and frozen robustness diagnostics.
 - Phase 3: QLoRA training and the controlled GPU experiment.
 - Phase 4: diagnostics and portfolio release.
 
 Never add model downloads, training, inference, GPU packages, services, deployment, authentication, or a database during Phase 1.
+
+During Phase 2, never fit on validation data or evaluate the official held-out test split. The challenge suite is diagnostic only: do not tune against it or copy failures into training. Qwen dependencies remain optional and model imports must stay lazy so ordinary tests remain CPU-only.
 
 ## Evidence and testing
 

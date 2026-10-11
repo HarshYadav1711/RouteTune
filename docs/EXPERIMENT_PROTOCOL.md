@@ -10,7 +10,7 @@ For example, `" Card   LOST "` and `"card lost"` normalize to the same key. If o
 
 Sampling derives a SHA-256 seed from the global seed and each source/label namespace, then ranks candidates deterministically. A fixed seed matters because changing examples can change measured performance; without control, a code change and a sample change cannot be separated. Source SHA-256 fingerprints make exact input bytes identifiable and changes detectable, but do not prove upstream trust.
 
-## Future model experiment (not implemented in Phase 1)
+## Future model experiment (not implemented)
 
 The fixed base model is `Qwen/Qwen2.5-0.5B-Instruct`. Phase 3 will use NF4 4-bit quantization with double quantization; LoRA rank 8, alpha 16, dropout 0.05; targets `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, and `down_proj`; two epochs; learning rate `1.5e-4`; gradient accumulation 4; maximum sequence length 256; and completion-only supervised training.
 
@@ -37,4 +37,16 @@ Later phases plan accuracy, macro/micro/weighted precision, recall and F1, per-c
 - Repeated held-out inspection or challenge-suite tuning would bias conclusions.
 
 Synthetic unit tests verify parsing, sampling, cache, and rejection behavior in isolation. They cannot prove the remote files are reachable, unchanged, large enough, or compatible end to end; only the separate official-data integration command can establish those facts for a specific fingerprint and time.
+
+## Phase 2 evaluation contract
+
+Every evaluated row retains a deterministic identifier, input, expected class, raw output, parsed class or null, strict validity, correctness, and optional per-example latency. A generation is valid only when trimming surrounding whitespace produces exactly one configured label. Casing changes, prefixes, explanations, punctuation, multiple labels, unknown labels, and empty output are invalid and are never repaired.
+
+Accuracy is correct predictions divided by all predictions. For each official class, precision is `TP / (TP + FP)`, recall is `TP / support`, and F1 is their harmonic mean; a zero denominator produces zero. Macro values average the eight official classes equally. Invalid output is an `__invalid__` confusion-matrix column, counts as incorrect and as a false negative for its expected class, and remains in every total. It is not a ninth intent class.
+
+The classical baseline is a scikit-learn pipeline with lowercase word unigrams/bigrams and logistic regression (`C=1.0`, `solver=lbfgs`, `max_iter=1000`, seed 42). The vectorizer and classifier fit only the 360 training rows. Validation has 80 rows; the official test split is neither fitted nor evaluated. Per-example CPU latency covers `Pipeline.predict([text])`, including TF-IDF transformation and classification. Fit time is separate, and these measurements are not comparable to future GPU generation without matched hardware and boundaries.
+
+Qwen uses the tokenizer's chat template with separate system and user messages, greedy decoding, `do_sample=False`, at most 32 new tokens, EOS/padding IDs, and completion-only decoding. Tokenization and generation are timed separately; CUDA synchronization surrounds generation when available. The customer message is untrusted task data, and no expected label is passed into prompt construction.
+
+The frozen robustness suite contains 20 handcrafted clear, paraphrased, boundary, prompt-injection, out-of-domain, and ambiguous cases. Ambiguous, boundary, and out-of-domain cases have null expectations and produce diagnostics rather than invented accuracy. Its SHA-256 fingerprint is `85ebd0e590b90c352370bb4d4772a3f886c4e4055ec0c2509c9d01f9a17049a5`. It has no normalized exact-text overlap with the selected 600 BANKING77 records and must not become training or repeated optimization data.
 

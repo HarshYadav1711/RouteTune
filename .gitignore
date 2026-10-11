@@ -3,6 +3,7 @@
 /.pytest-tmp*/
 /.pytest_cache/
 /data/
+/artifacts/
 /dist/
 /build/
 *.egg-info/

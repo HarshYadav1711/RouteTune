@@ -8,13 +8,20 @@ version = "0.1.0"
 description = "Evidence-first BANKING77 data foundation for RouteTune"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["scikit-learn>=1.6,<2"]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<9"]
+qwen = [
+    "accelerate>=1,<2",
+    "bitsandbytes>=0.45,<1",
+    "torch>=2.6,<3",
+    "transformers>=4.48,<5",
+]
 
 [project.scripts]
 routetune-data = "routetune.data:main"
+routetune = "routetune.cli:main"
 
 [tool.setuptools]
 packages = ["routetune"]
@@ -22,4 +29,5 @@ packages = ["routetune"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+markers = ["integration: requires the validated local BANKING77 cache"]
 

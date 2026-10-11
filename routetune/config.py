@@ -1,4 +1,4 @@
-"""Fixed Phase 1 experiment configuration."""
+"""Fixed experiment configuration."""
 
 from dataclasses import dataclass
 
@@ -12,6 +12,12 @@ TARGET_LABELS = (
     "cash_withdrawal_not_recognised",
     "lost_or_stolen_card",
     "change_pin",
+)
+
+MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+MAX_NEW_TOKENS = 32
+EXPECTED_SELECTION_FINGERPRINT = (
+    "a4fc6b6b55100d7996170686e5c1493f4d890fcd9b6d21d7ae35a4ec60dfa129"
 )
 
 

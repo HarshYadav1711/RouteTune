@@ -402,6 +402,21 @@ def build_splits(
     return splits
 
 
+def selection_fingerprint(splits: DatasetSplits) -> str:
+    """Fingerprint the ordered records from all three fixed splits."""
+
+    payload = json.dumps(
+        [
+            [record.text, record.category, record.source]
+            for split in (splits.train, splits.validation, splits.test)
+            for record in split
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _counts(records: Iterable[Record], labels: tuple[str, ...]) -> dict[str, int]:
     counts = Counter(record.category for record in records)
     return {label: counts[label] for label in labels}

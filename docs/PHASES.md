@@ -12,9 +12,13 @@ Evidence: an isolated editable install with declared test dependencies succeeded
 
 ## 2. Evaluation Engine and Baselines
 
-Status: **NOT IMPLEMENTED**.
+Status: **VERIFIED** on 2026-10-11 for CPU evaluation and inference contracts. Real quantized Qwen execution is **NOT VERIFIED**.
 
 Gate: frozen evaluation contract, strict output parser, shared examples, TF-IDF/logistic-regression and untuned-Qwen baselines, metrics and artifact integrity, with CPU/GPU evidence correctly separated.
+
+Evidence: 48 offline/network-free tests passed, including the retained 15 Phase 1 tests and a validated-cache integration check. The locked selection fingerprint remains `a4fc6b6b55100d7996170686e5c1493f4d890fcd9b6d21d7ae35a4ec60dfa129`. Scikit-learn 1.9.1 fitted 360 training rows and evaluated only 80 validation rows: accuracy `0.8875`, macro F1 `0.8868696362117415`, 71/80 correct, validity rate `1.0`, and zero invalid predictions. Two executions produced identical 80 predicted labels. The complete final artifact is `artifacts/phase2/tfidf-validation-20261011-final/result.json`; it records `official_test_evaluated: false` and is excluded from Git.
+
+The 20-case challenge fingerprint is `85ebd0e590b90c352370bb4d4772a3f886c4e4055ec0c2509c9d01f9a17049a5`, with no normalized overlap against selected BANKING77 records. Prompt construction, chat-template use, completion slicing, greedy settings, invalid-output preservation, and mocked CUDA synchronization are CPU-tested. A GTX 1650 Ti is visible, but optional Qwen dependencies were deliberately not installed; no model weights were downloaded.
 
 ## 3. QLoRA Training and Controlled GPU Experiment
 
