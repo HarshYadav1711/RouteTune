@@ -1,3 +1,4 @@
+from collections import UserDict
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -106,14 +107,20 @@ def _mock_phase3_until_smoke(
 class FakeTokenizer:
     pad_token_id = 0
 
-    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+    def __init__(self, wrap=lambda token_ids: token_ids):
+        self.wrap = wrap
+
+    def apply_chat_template(
+        self, messages, *, tokenize, add_generation_prompt, return_dict
+    ):
         assert tokenize is True
+        assert return_dict is True
         prompt = [10, 11, 12]
         if add_generation_prompt:
             assert [message["role"] for message in messages] == ["system", "user"]
-            return prompt
+            return self.wrap(prompt)
         label = TARGET_LABELS.index(messages[-1]["content"]) + 20
-        return prompt + [label, 2]
+        return self.wrap(prompt + [label, 2])
 
     def decode(self, tokens, *, skip_special_tokens):
         assert skip_special_tokens is True
@@ -123,6 +130,18 @@ class FakeTokenizer:
 RECORD = Record("Where is my card?", "card_arrival", "official_train")
 
 
+class TensorLike:
+    def __init__(self, value):
+        self.value = value
+
+    def tolist(self):
+        return self.value
+
+
+class BatchEncodingLike(UserDict):
+    pass
+
+
 def test_prompt_completion_reuses_inference_prompt_and_exact_label():
     example = prompt_completion(RECORD)
     assert example["prompt"][1] == {"role": "user", "content": RECORD.text}
@@ -130,13 +149,49 @@ def test_prompt_completion_reuses_inference_prompt_and_exact_label():
     assert RECORD.category not in example["prompt"][1]["content"]
 
 
-def test_tokenization_masks_prompt_and_preserves_completion():
-    tokenized = tokenize_training_record(RECORD, FakeTokenizer())
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        lambda token_ids: token_ids,
+        lambda token_ids: [token_ids],
+        lambda token_ids: TensorLike([token_ids]),
+        lambda token_ids: {"input_ids": token_ids},
+        lambda token_ids: BatchEncodingLike({"input_ids": TensorLike([token_ids])}),
+    ],
+    ids=["flat-list", "one-example-list", "tensor", "dictionary", "batch-encoding"],
+)
+def test_tokenization_accepts_supported_outputs_and_preserves_loss_masks(wrap):
+    tokenized = tokenize_training_record(RECORD, FakeTokenizer(wrap))
     assert tokenized == {
         "input_ids": [10, 11, 12, 20, 2],
         "attention_mask": [1, 1, 1, 1, 1],
         "labels": [-100, -100, -100, 20, 2],
     }
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ({}, "missing input_ids"),
+        ({"input_ids": "tokens"}, "one-example token sequence"),
+        ({"input_ids": []}, "sequence is empty"),
+        ({"input_ids": [[10], [11]]}, "unexpected batch of 2"),
+        ({"input_ids": [[[10, 11]]]}, "only integers"),
+        ({"input_ids": [10, "11"]}, "only integers"),
+        ({"input_ids": [10, -1]}, "non-negative integers"),
+    ],
+)
+def test_tokenization_rejects_missing_or_malformed_input_ids(value, message):
+    with pytest.raises(TrainingError, match=message):
+        tokenize_training_record(RECORD, FakeTokenizer(lambda _token_ids: value))
+
+
+def test_tokenization_still_rejects_prompt_prefix_mismatch():
+    def mismatch(token_ids):
+        return token_ids if len(token_ids) == 3 else [99, *token_ids[1:]]
+
+    with pytest.raises(TrainingError, match="preserve the inference prompt prefix"):
+        tokenize_training_record(RECORD, FakeTokenizer(mismatch))
 
 
 def test_truncation_never_silently_removes_target():

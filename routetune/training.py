@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import gc
 import importlib.metadata
 import inspect
 import json
 import math
+import operator
 import platform
 import statistics
 import sys
@@ -136,11 +138,34 @@ def prompt_completion(record: Record) -> dict[str, list[dict[str, str]]]:
 
 
 def _token_ids(value: Any) -> list[int]:
+    if isinstance(value, Mapping):
+        if "input_ids" not in value:
+            raise TrainingError("tokenizer output is missing input_ids")
+        value = value["input_ids"]
     if hasattr(value, "tolist"):
         value = value.tolist()
-    if value and isinstance(value[0], list):
+    if not isinstance(value, (list, tuple)):
+        raise TrainingError("tokenizer input_ids must be a one-example token sequence")
+    if not value:
+        raise TrainingError("tokenizer input_ids sequence is empty")
+    if isinstance(value[0], (list, tuple)):
+        if len(value) != 1:
+            raise TrainingError(
+                f"tokenizer input_ids contains an unexpected batch of {len(value)} examples"
+            )
         value = value[0]
-    return [int(token) for token in value]
+        if not value:
+            raise TrainingError("tokenizer input_ids sequence is empty")
+    token_ids = []
+    for token in value:
+        try:
+            token_id = operator.index(token)
+        except TypeError as exc:
+            raise TrainingError("tokenizer input_ids must contain only integers") from exc
+        if isinstance(token, bool) or token_id < 0:
+            raise TrainingError("tokenizer input_ids must contain non-negative integers")
+        token_ids.append(token_id)
+    return token_ids
 
 
 def tokenize_training_record(
@@ -150,10 +175,14 @@ def tokenize_training_record(
     prompt = example["prompt"]
     full_messages = prompt + example["completion"]
     prompt_ids = _token_ids(
-        tokenizer.apply_chat_template(prompt, tokenize=True, add_generation_prompt=True)
+        tokenizer.apply_chat_template(
+            prompt, tokenize=True, add_generation_prompt=True, return_dict=True
+        )
     )
     input_ids = _token_ids(
-        tokenizer.apply_chat_template(full_messages, tokenize=True, add_generation_prompt=False)
+        tokenizer.apply_chat_template(
+            full_messages, tokenize=True, add_generation_prompt=False, return_dict=True
+        )
     )
     if input_ids[: len(prompt_ids)] != prompt_ids:
         raise TrainingError("chat template did not preserve the inference prompt prefix")
