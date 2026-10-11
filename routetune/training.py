@@ -85,23 +85,40 @@ class QLoRAConfig:
 FIXED_QLORA_CONFIG = QLoRAConfig()
 GPU_PACKAGES = (
     "torch",
+    "torchvision",
     "transformers",
     "trl",
     "peft",
     "accelerate",
     "bitsandbytes",
     "datasets",
+    "fsspec",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "requests",
+    "huggingface-hub",
+    "safetensors",
+    "tokenizers",
     "scikit-learn",
 )
 PINNED_GPU_PACKAGE_VERSIONS = {
     "accelerate": "1.15.0",
     "bitsandbytes": "0.50.2",
     "datasets": "4.7.0",
+    "fsspec": "2025.12.0",
+    "numpy": "2.0.2",
+    "pandas": "2.2.3",
     "peft": "0.21.2",
+    "pyarrow": "21.0.0",
+    "requests": "2.32.4",
     "torch": "2.14.1",
+    "torchvision": "0.29.1",
     "transformers": "5.19.0",
     "trl": "1.15.0",
 }
+ROUTETUNE_DEPENDENCY_ROOTS = (*PINNED_GPU_PACKAGE_VERSIONS, "routetune")
+COLAB_OPERATIONAL_ROOTS = ("google-colab", "gcsfs")
 
 
 def validate_qlora_config(config: QLoRAConfig) -> None:
@@ -275,13 +292,103 @@ def verify_pinned_gpu_dependencies() -> None:
         raise TrainingError(f"installed GPU dependency lock differs: {', '.join(mismatches)}")
 
 
-def verify_transformers_runtime(transformers: Any) -> None:
-    installed = importlib.metadata.version("transformers")
-    if getattr(transformers, "__version__", None) != installed:
+def dependency_packages(roots: Iterable[str]) -> set[str]:
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    required = {canonicalize_name(package) for package in roots}
+    pending = list(required)
+    while pending:
+        package = pending.pop()
+        try:
+            requirements = importlib.metadata.requires(package) or ()
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        for value in requirements:
+            requirement = Requirement(value)
+            if requirement.marker is not None and not requirement.marker.evaluate():
+                continue
+            name = canonicalize_name(requirement.name)
+            if name not in required:
+                required.add(name)
+                pending.append(name)
+    return required
+
+
+def assess_pip_check(
+    output: str,
+    returncode: int,
+    *,
+    route_packages: set[str] | None = None,
+    operational_packages: set[str] | None = None,
+) -> dict[str, Any]:
+    from packaging.utils import canonicalize_name
+
+    route = dependency_packages(ROUTETUNE_DEPENDENCY_ROOTS) if route_packages is None else {
+        canonicalize_name(package) for package in route_packages
+    }
+    operational = dependency_packages(COLAB_OPERATIONAL_ROOTS) if operational_packages is None else {
+        canonicalize_name(package) for package in operational_packages
+    }
+    issues = [
+        line.strip()
+        for line in output.splitlines()
+        if line.strip()
+        and line.strip() != "No broken requirements found."
+        and not line.lstrip().startswith("WARNING:")
+    ]
+    route_conflicts: list[str] = []
+    operational_conflicts: list[str] = []
+    unrelated: list[str] = []
+    for line in issues:
+        parts = line.split()
+        if len(parts) < 3 or parts[2] not in {"has", "requires", "is"}:
+            route_conflicts.append(line)
+            continue
+        requester = canonicalize_name(parts[0])
+        if requester in route:
+            route_conflicts.append(line)
+        elif requester in operational:
+            operational_conflicts.append(line)
+        else:
+            unrelated.append(line)
+    if returncode != 0 and not issues:
+        route_conflicts.append(f"pip check exited with status {returncode} without a parseable conflict")
+    return {
+        "ready": not route_conflicts and not operational_conflicts,
+        "pip_check_clean": returncode == 0,
+        "route_conflicts": route_conflicts,
+        "operational_conflicts": operational_conflicts,
+        "unrelated_conflicts": unrelated,
+        "unrelated_conflicts_reason": (
+            "requesting packages are outside RouteTune and Colab/GPU dependency closures"
+            if unrelated
+            else None
+        ),
+        "pip_check_output": output,
+    }
+
+
+def verify_imported_package_version(package: str, module: Any) -> None:
+    installed = importlib.metadata.version(package)
+    imported = getattr(module, "__version__", None)
+    if imported != installed:
+        label = "Transformers" if package == "transformers" else package
         raise TrainingError(
-            f"mixed Transformers runtime: imported {getattr(transformers, '__version__', None)!r}, "
-            f"installed {installed!r}; restart the runtime after installation"
+            f"mixed {label} runtime: imported {imported!r}, installed {installed!r}; "
+            "restart the runtime after installation"
         )
+
+
+def verify_torch_runtime(torch: Any, torchvision: Any) -> None:
+    verify_imported_package_version("torch", torch)
+    verify_imported_package_version("torchvision", torchvision)
+    if getattr(getattr(torch, "version", None), "cuda", None) != "13.0":
+        raise TrainingError("installed PyTorch is not the required CUDA 13.0 build")
+
+
+def verify_transformers_runtime(transformers: Any) -> None:
+    verify_imported_package_version("transformers", transformers)
     auto_config = getattr(transformers, "AutoConfig", None)
     pretrained_config = getattr(transformers, "PreTrainedConfig", None)
     if not callable(getattr(auto_config, "from_pretrained", None)) or not callable(
@@ -301,12 +408,15 @@ def verify_transformers_runtime(transformers: Any) -> None:
 def verify_training_apis() -> None:
     verify_pinned_gpu_dependencies()
     try:
+        import torch
+        import torchvision
         import transformers
         from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
         from trl import SFTConfig, SFTTrainer
     except ImportError as exc:
         raise TrainingError(f"GPU dependency is unavailable: {exc}") from exc
+    verify_torch_runtime(torch, torchvision)
     verify_transformers_runtime(transformers)
     required_sft_config = {
         "completion_only_loss",

@@ -2,6 +2,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import sys
+import tomllib
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -12,10 +13,12 @@ from routetune.evaluation import prediction_record
 from routetune.experiment import create_run, update_run
 from routetune.training import (
     FIXED_QLORA_CONFIG,
+    GPU_PACKAGES,
     PINNED_GPU_PACKAGE_VERSIONS,
     TrainingError,
     _load_quantized_base,
     _load_recorded_quantized_base,
+    assess_pip_check,
     adapter_parameter_evidence,
     assert_identical_order,
     pad_tokenized_batch,
@@ -28,6 +31,7 @@ from routetune.training import (
     verify_evaluation_artifact,
     verify_masked_batch,
     verify_pinned_gpu_dependencies,
+    verify_torch_runtime,
     verify_transformers_runtime,
 )
 
@@ -150,6 +154,91 @@ def test_pinned_gpu_dependency_versions_are_enforced(monkeypatch):
     installed["transformers"] = "5.18.0"
     with pytest.raises(TrainingError, match="transformers=5.18.0.*expected 5.19.0"):
         verify_pinned_gpu_dependencies()
+
+
+def test_pinned_gpu_dependency_versions_accept_cuda_local_suffix(monkeypatch):
+    monkeypatch.setattr(
+        "routetune.training.importlib.metadata.version",
+        lambda package: f"{PINNED_GPU_PACKAGE_VERSIONS[package]}+cu130"
+        if package in {"torch", "torchvision"}
+        else PINNED_GPU_PACKAGE_VERSIONS[package],
+    )
+    verify_pinned_gpu_dependencies()
+
+
+def test_torch_and_torchvision_runtime_versions_and_cuda_match(monkeypatch):
+    installed = {"torch": "2.14.1+cu130", "torchvision": "0.29.1+cu130"}
+    monkeypatch.setattr(
+        "routetune.training.importlib.metadata.version", lambda package: installed[package]
+    )
+    torch = SimpleNamespace(__version__="2.14.1+cu130", version=SimpleNamespace(cuda="13.0"))
+    torchvision = SimpleNamespace(__version__="0.29.1+cu130")
+    verify_torch_runtime(torch, torchvision)
+
+    torchvision.__version__ = "0.26.0+cu130"
+    with pytest.raises(TrainingError, match="mixed torchvision runtime"):
+        verify_torch_runtime(torch, torchvision)
+
+
+def test_torch_runtime_requires_cuda_13_build(monkeypatch):
+    installed = {"torch": "2.14.1", "torchvision": "0.29.1"}
+    monkeypatch.setattr(
+        "routetune.training.importlib.metadata.version", lambda package: installed[package]
+    )
+    torch = SimpleNamespace(__version__="2.14.1", version=SimpleNamespace(cuda="12.8"))
+    torchvision = SimpleNamespace(__version__="0.29.1")
+    with pytest.raises(TrainingError, match="CUDA 13.0"):
+        verify_torch_runtime(torch, torchvision)
+
+
+def test_pip_check_allows_but_records_unrelated_preinstalled_conflicts():
+    output = "bigframes 2.0 has requirement pyarrow<20, but you have pyarrow 21.0.0."
+    result = assess_pip_check(
+        output,
+        1,
+        route_packages={"routetune", "torchvision"},
+        operational_packages={"google-colab"},
+    )
+    assert result == {
+        "ready": True,
+        "pip_check_clean": False,
+        "route_conflicts": [],
+        "operational_conflicts": [],
+        "unrelated_conflicts": [output],
+        "unrelated_conflicts_reason": (
+            "requesting packages are outside RouteTune and Colab/GPU dependency closures"
+        ),
+        "pip_check_output": output,
+    }
+
+
+def test_pip_check_fails_closed_on_unparseable_failure():
+    output = "unexpected resolver failure"
+    result = assess_pip_check(
+        output,
+        2,
+        route_packages=set(),
+        operational_packages=set(),
+    )
+    assert result["ready"] is False
+    assert result["route_conflicts"] == [output]
+
+
+@pytest.mark.parametrize(
+    ("package", "category"),
+    [("torchvision", "route_conflicts"), ("google-colab", "operational_conflicts"), ("gcsfs", "operational_conflicts")],
+)
+def test_pip_check_blocks_required_or_colab_operational_conflicts(package, category):
+    output = f"{package} 1.0 has requirement dependency==1, but you have dependency 2."
+    result = assess_pip_check(
+        output,
+        1,
+        route_packages={"torchvision"},
+        operational_packages={"google-colab", "gcsfs"},
+    )
+    assert result["ready"] is False
+    assert result["pip_check_clean"] is False
+    assert result[category] == [output]
 
 
 def test_transformers_runtime_rejects_mixed_install(monkeypatch):
@@ -301,18 +390,43 @@ def test_saved_adapter_reload_uses_manifest_revision(monkeypatch, tmp_path):
     assert captured == [MODEL_SHA]
 
 
-def test_colab_workflow_forces_clean_restart_without_transformers_patches():
+def test_colab_workflow_installs_minimally_then_forces_clean_restart():
     notebook = json.loads(
         (Path(__file__).parents[1] / "notebooks" / "RouteTune_Colab.ipynb").read_text(
             encoding="utf-8"
         )
     )
     source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
-    assert "--force-reinstall" in source
+    assert "--force-reinstall" not in source
+    assert '"--upgrade"' not in source
+    assert '"uninstall", "-y", "torchaudio"' in source
+    assert "https://download.pytorch.org/whl/cu130" in source
+    assert "torch==2.14.1" in source
+    assert "torchvision==0.29.1" in source
+    assert ".colab-dependencies-installed" in source
     assert "os.kill(os.getpid(), signal.SIGKILL)" in source
+    assert "capture_output=True" in source
+    assert "assess_pip_check" in source
+    assert "dependency-readiness.json" in source
     assert "verify_gpu_environment" in source
     assert "PreTrainedConfig.__init__" not in source
     assert '_commit_hash = "main"' not in source
+
+
+def test_gpu_extra_preserves_compatible_runtime_pins():
+    project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    requirements = set(project["project"]["optional-dependencies"]["gpu"])
+    assert {
+        "torch==2.14.1",
+        "torchvision==0.29.1",
+        "numpy==2.0.2",
+        "pandas==2.2.3",
+        "requests==2.32.4",
+        "fsspec==2025.12.0",
+        "pyarrow==21.0.0",
+    }.issubset(requirements)
+    assert set(PINNED_GPU_PACKAGE_VERSIONS).issubset(GPU_PACKAGES)
+    assert {"huggingface-hub", "safetensors", "tokenizers"}.issubset(GPU_PACKAGES)
 
 
 def test_evaluation_conditions_must_keep_identical_order():
