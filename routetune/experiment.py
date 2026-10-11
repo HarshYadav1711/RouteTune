@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -37,6 +38,7 @@ REQUIRED_HELDOUT_EVIDENCE = (
     "validation_complete",
     "configuration_frozen",
 )
+MODEL_REVISION_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 
 
 def utc_now() -> str:
@@ -46,6 +48,10 @@ def utc_now() -> str:
 def canonical_sha256(value: object) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def is_immutable_model_revision(value: object) -> bool:
+    return isinstance(value, str) and MODEL_REVISION_PATTERN.fullmatch(value) is not None
 
 
 def atomic_json_write(path: Path, value: dict[str, Any]) -> None:
@@ -114,6 +120,10 @@ def load_manifest(run_dir: Path) -> dict[str, Any]:
             raise ExperimentError("run directory and manifest identity differ")
         if canonical_sha256(manifest["configuration"]) != manifest["configuration_sha256"]:
             raise ExperimentError("run configuration fingerprint is stale")
+        if manifest["model_revision"] is not None and not is_immutable_model_revision(
+            manifest["model_revision"]
+        ):
+            raise ExperimentError("run model revision is not a full commit SHA")
         if not isinstance(manifest["evidence"], dict) or not isinstance(manifest["artifacts"], dict):
             raise ExperimentError(f"invalid run manifest: {path}")
     except ExperimentError:
@@ -145,6 +155,10 @@ def update_run(
     if environment is not None:
         manifest["environment"] = environment
     if model_revision is not None:
+        if not is_immutable_model_revision(model_revision):
+            raise ExperimentError("model revision must be a full 40-character hexadecimal SHA")
+        if manifest["model_revision"] is not None and manifest["model_revision"] != model_revision:
+            raise ExperimentError("run model revision cannot change")
         manifest["model_revision"] = model_revision
     if failure is not None:
         manifest["failure"] = failure
@@ -177,6 +191,8 @@ def verify_adapter(run_dir: Path) -> Path:
     manifest = load_manifest(run_dir)
     if manifest["state"] not in {"TRAINED", "VERIFIED"}:
         raise ExperimentError("adapter requires TRAINED or VERIFIED run evidence")
+    if not is_immutable_model_revision(manifest["model_revision"]):
+        raise ExperimentError("adapter run has no immutable model revision")
     try:
         record = manifest["artifacts"]["adapter"]
         relative_path = Path(record["path"])

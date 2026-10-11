@@ -1,18 +1,24 @@
 from dataclasses import replace
 import json
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from routetune.config import TARGET_LABELS
+from routetune.config import MODEL_ID, TARGET_LABELS
 from routetune.data import Record
 from routetune.evaluation import prediction_record
+from routetune.experiment import create_run, update_run
 from routetune.training import (
     FIXED_QLORA_CONFIG,
     TrainingError,
+    _load_quantized_base,
+    _load_recorded_quantized_base,
     adapter_parameter_evidence,
     assert_identical_order,
     pad_tokenized_batch,
     prompt_completion,
+    resolve_model_revision,
     tokenize_records,
     tokenize_training_record,
     validate_qlora_config,
@@ -20,6 +26,9 @@ from routetune.training import (
     verify_evaluation_artifact,
     verify_masked_batch,
 )
+
+
+MODEL_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
 class FakeTokenizer:
@@ -125,6 +134,116 @@ def test_dependency_failure_is_clear_without_touching_gpu(monkeypatch):
     )
     with pytest.raises(TrainingError, match="incompatible TRL"):
         verify_gpu_environment()
+
+
+class FakeHubApi:
+    def __init__(self, result=None, error=None):
+        self.result = result
+        self.error = error
+        self.calls = []
+
+    def model_info(self, model_id, *, revision):
+        self.calls.append((model_id, revision))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def test_model_revision_resolution_uses_hugging_face_api():
+    api = FakeHubApi(SimpleNamespace(sha=MODEL_SHA))
+    assert resolve_model_revision(api=api) == MODEL_SHA
+    assert api.calls == [(MODEL_ID, "main")]
+
+
+@pytest.mark.parametrize("metadata", [SimpleNamespace(), SimpleNamespace(sha=None), SimpleNamespace(sha="")])
+def test_model_revision_resolution_rejects_missing_sha(metadata):
+    with pytest.raises(TrainingError, match="has no commit SHA"):
+        resolve_model_revision(api=FakeHubApi(metadata))
+
+
+@pytest.mark.parametrize("revision", ["main", "a" * 39, "g" * 40, 123])
+def test_model_revision_resolution_rejects_invalid_sha(revision):
+    with pytest.raises(TrainingError, match="malformed commit SHA"):
+        resolve_model_revision(api=FakeHubApi(SimpleNamespace(sha=revision)))
+
+
+def test_model_revision_resolution_reports_api_failure():
+    with pytest.raises(
+        TrainingError,
+        match="model revision lookup failed.*ConnectionError: network unavailable",
+    ):
+        resolve_model_revision(api=FakeHubApi(error=ConnectionError("network unavailable")))
+
+
+def test_model_revision_resolution_reports_unavailable_model():
+    class RepositoryNotFoundError(Exception):
+        pass
+
+    with pytest.raises(
+        TrainingError,
+        match="model revision lookup failed.*RepositoryNotFoundError: model unavailable",
+    ):
+        resolve_model_revision(
+            api=FakeHubApi(error=RepositoryNotFoundError("model unavailable"))
+        )
+
+
+def test_quantized_model_and_tokenizer_use_same_immutable_revision(monkeypatch):
+    calls = []
+    torch = ModuleType("torch")
+    torch.float16 = object()
+    transformers = ModuleType("transformers")
+
+    class AutoTokenizer:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            calls.append(("tokenizer", model_id, kwargs))
+            return SimpleNamespace(pad_token_id=0, padding_side=None)
+
+    class AutoModelForCausalLM:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            calls.append(("model", model_id, kwargs))
+            quantization = SimpleNamespace(
+                bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True
+            )
+            return SimpleNamespace(
+                is_loaded_in_4bit=True,
+                config=SimpleNamespace(quantization_config=quantization),
+            )
+
+    class BitsAndBytesConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    transformers.AutoTokenizer = AutoTokenizer
+    transformers.AutoModelForCausalLM = AutoModelForCausalLM
+    transformers.BitsAndBytesConfig = BitsAndBytesConfig
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    _, _, revision = _load_quantized_base(MODEL_SHA)
+    assert revision == MODEL_SHA
+    assert [call[2]["revision"] for call in calls] == [MODEL_SHA, MODEL_SHA]
+
+
+def test_saved_adapter_reload_uses_manifest_revision(monkeypatch, tmp_path):
+    run = create_run(
+        tmp_path,
+        configuration={"fixture": True},
+        fingerprints={"selection": "fixture"},
+        environment={},
+    )
+    update_run(run, model_revision=MODEL_SHA)
+    captured = []
+
+    def fake_load(revision):
+        captured.append(revision)
+        return "tokenizer", "model", revision
+
+    monkeypatch.setattr("routetune.training._load_quantized_base", fake_load)
+    assert _load_recorded_quantized_base(run) == ("tokenizer", "model", MODEL_SHA)
+    assert captured == [MODEL_SHA]
 
 
 def test_evaluation_conditions_must_keep_identical_order():

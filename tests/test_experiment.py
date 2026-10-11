@@ -15,6 +15,8 @@ from routetune.experiment import (
     verify_adapter,
 )
 
+MODEL_SHA = "a" * 40
+
 
 def new_run(tmp_path):
     return create_run(
@@ -62,7 +64,7 @@ def test_failure_and_interruption_preserve_evidence(tmp_path):
 
 
 def complete_adapter(run):
-    update_run(run, state="RUNNING", model_revision="revision")
+    update_run(run, state="RUNNING", model_revision=MODEL_SHA)
     adapter = run / "adapter"
     adapter.mkdir()
     (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
@@ -72,7 +74,7 @@ def complete_adapter(run):
         {
             "run_id": run.name,
             "configuration_sha256": canonical_sha256({"model": "fixture", "seed": 42}),
-            "model_revision": "revision",
+            "model_revision": MODEL_SHA,
         },
     )
     hashes = adapter_hashes(adapter)
@@ -92,6 +94,48 @@ def test_adapter_identity_and_hashes_reject_stale_artifacts(tmp_path):
     (adapter / "adapter_model.safetensors").write_bytes(b"stale")
     with pytest.raises(ExperimentError, match="recorded hashes"):
         verify_adapter(run)
+
+
+def test_adapter_without_immutable_model_revision_is_rejected(tmp_path):
+    run = new_run(tmp_path)
+    update_run(run, state="RUNNING")
+    adapter = run / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    atomic_json_write(
+        adapter / "adapter_identity.json",
+        {
+            "run_id": run.name,
+            "configuration_sha256": canonical_sha256({"model": "fixture", "seed": 42}),
+            "model_revision": None,
+        },
+    )
+    update_run(
+        run,
+        state="TRAINED",
+        artifacts={"adapter": {"path": "adapter", "sha256": adapter_hashes(adapter)}},
+    )
+    with pytest.raises(ExperimentError, match="no immutable model revision"):
+        verify_adapter(run)
+
+
+def test_manifest_model_revision_is_immutable_and_well_formed(tmp_path):
+    run = new_run(tmp_path)
+    update_run(run, model_revision=MODEL_SHA)
+    assert load_manifest(run)["model_revision"] == MODEL_SHA
+
+    with pytest.raises(ExperimentError, match="cannot change"):
+        update_run(run, model_revision="b" * 40)
+    with pytest.raises(ExperimentError, match="40-character"):
+        update_run(run, model_revision="main")
+
+    path = run / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["model_revision"] = "malformed"
+    atomic_json_write(path, manifest)
+    with pytest.raises(ExperimentError, match="not a full commit SHA"):
+        load_manifest(run)
 
 
 def test_heldout_gate_requires_all_verified_evidence_and_is_single_use(tmp_path):

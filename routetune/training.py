@@ -34,6 +34,7 @@ from .experiment import (
     atomic_json_write,
     claim_heldout,
     create_run,
+    is_immutable_model_revision,
     load_manifest,
     mark_failure,
     update_run,
@@ -333,14 +334,37 @@ def prepare_phase3_run(
     )
 
 
-def _load_quantized_base() -> tuple[Any, Any, str]:
-    import torch
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+def resolve_model_revision(model_id: str = MODEL_ID, *, api: Any | None = None) -> str:
+    if api is None:
+        try:
+            from huggingface_hub import HfApi
+        except ImportError as exc:
+            raise TrainingError("huggingface_hub is unavailable; model revision cannot be resolved") from exc
+        api = HfApi()
+    try:
+        model_info = api.model_info(model_id, revision="main")
+    except Exception as exc:
+        raise TrainingError(
+            f"Hugging Face model revision lookup failed for {model_id!r}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    revision = getattr(model_info, "sha", None)
+    if revision is None or revision == "":
+        raise TrainingError(f"Hugging Face model metadata for {model_id!r} has no commit SHA")
+    if not is_immutable_model_revision(revision):
+        raise TrainingError(
+            f"Hugging Face model metadata for {model_id!r} returned a malformed commit SHA: "
+            f"{revision!r}"
+        )
+    return revision
 
-    config = AutoConfig.from_pretrained(MODEL_ID)
-    revision = getattr(config, "_commit_hash", None)
-    if not revision:
-        raise TrainingError("Hugging Face model revision could not be resolved")
+
+def _load_quantized_base(revision: str) -> tuple[Any, Any, str]:
+    if not is_immutable_model_revision(revision):
+        raise TrainingError("model revision must be a full 40-character hexadecimal SHA")
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, revision=revision)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -365,6 +389,13 @@ def _load_quantized_base() -> tuple[Any, Any, str]:
     if read("bnb_4bit_quant_type") != "nf4" or read("bnb_4bit_use_double_quant") is not True:
         raise TrainingError("loaded quantization is not NF4 with double quantization")
     return tokenizer, model, revision
+
+
+def _load_recorded_quantized_base(run_dir: Path) -> tuple[Any, Any, str]:
+    revision = load_manifest(run_dir)["model_revision"]
+    if not is_immutable_model_revision(revision):
+        raise TrainingError("run manifest does not contain an immutable model revision")
+    return _load_quantized_base(revision)
 
 
 def _attach_lora(model: Any) -> tuple[Any, dict[str, Any]]:
@@ -567,8 +598,9 @@ def execute_phase3_training(run_dir: Path, cache_dir: Path) -> Path:
     torch.cuda.manual_seed_all(FIXED_QLORA_CONFIG.seed)
     update_run(run_dir, state="RUNNING", environment=environment)
     try:
-        tokenizer, base_model, revision = _load_quantized_base()
+        revision = resolve_model_revision()
         update_run(run_dir, model_revision=revision, evidence={"fingerprints_verified": True})
+        tokenizer, base_model, revision = _load_quantized_base(revision)
         smoke = QwenAdapter(tokenizer, base_model, synchronize=torch.cuda.synchronize).classify(
             "My new card has not arrived yet."
         )
@@ -669,7 +701,7 @@ def execute_phase3_training(run_dir: Path, cache_dir: Path) -> Path:
         del trainer, model, base_model
         gc.collect()
         torch.cuda.empty_cache()
-        tokenizer, reloaded_base, reloaded_revision = _load_quantized_base()
+        tokenizer, reloaded_base, reloaded_revision = _load_recorded_quantized_base(run_dir)
         if reloaded_revision != revision:
             raise TrainingError("base-model revision changed during adapter reload")
         from peft import PeftModel
@@ -738,7 +770,7 @@ def execute_final_heldout(run_dir: Path, cache_dir: Path) -> Path:
         pipeline, fit_seconds = fit_baseline(splits.train, DEFAULT_CONFIG.seed)
         baseline = predict_records(pipeline, splits.test, TARGET_LABELS, "test")
         _write_evaluation(partial_paths["tfidf"], baseline)
-        tokenizer, base, revision = _load_quantized_base()
+        tokenizer, base, revision = _load_recorded_quantized_base(run_dir)
         if revision != manifest["model_revision"]:
             raise TrainingError("held-out base-model revision differs from training")
         untuned = _evaluate_qwen(
@@ -747,7 +779,7 @@ def execute_final_heldout(run_dir: Path, cache_dir: Path) -> Path:
         del base
         gc.collect()
         torch.cuda.empty_cache()
-        tokenizer, base, revision = _load_quantized_base()
+        tokenizer, base, revision = _load_recorded_quantized_base(run_dir)
         verified_adapter = verify_adapter(run_dir)
         tokenizer = AutoTokenizer.from_pretrained(verified_adapter, local_files_only=True)
         adapted_model = PeftModel.from_pretrained(base, verified_adapter)
