@@ -9,18 +9,21 @@ import pytest
 
 from routetune.config import MODEL_ID, TARGET_LABELS
 from routetune.data import Record
-from routetune.evaluation import prediction_record
-from routetune.experiment import create_run, update_run
+from routetune.evaluation import evaluate_predictions, prediction_record
+from routetune.experiment import create_run, load_manifest, update_run
+from routetune.inference import GenerationResult
 from routetune.training import (
     FIXED_QLORA_CONFIG,
     GPU_PACKAGES,
     PINNED_GPU_PACKAGE_VERSIONS,
     TrainingError,
+    _evaluate_qwen,
     _load_quantized_base,
     _load_recorded_quantized_base,
     assess_pip_check,
     adapter_parameter_evidence,
     assert_identical_order,
+    execute_phase3_training,
     pad_tokenized_batch,
     prompt_completion,
     resolve_model_revision,
@@ -37,6 +40,67 @@ from routetune.training import (
 
 
 MODEL_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+def _mock_phase3_until_smoke(
+    monkeypatch, tmp_path, *, smoke=None, smoke_error=None, load_error=None
+):
+    fingerprints = {"selection": "fixture"}
+    run = create_run(
+        tmp_path,
+        configuration={"fixture": True},
+        fingerprints=fingerprints,
+        environment={},
+    )
+    monkeypatch.setattr(
+        "routetune.training.load_locked_splits",
+        lambda *_args, **_kwargs: (SimpleNamespace(validation=()), fingerprints),
+    )
+    monkeypatch.setattr(
+        "routetune.training.verify_gpu_environment", lambda: {"cuda": True}
+    )
+    monkeypatch.setattr("routetune.training.resolve_model_revision", lambda: MODEL_SHA)
+
+    torch = ModuleType("torch")
+    torch.manual_seed = lambda _seed: None
+    torch.cuda = SimpleNamespace(
+        manual_seed_all=lambda _seed: None, synchronize=lambda: None
+    )
+    datasets = ModuleType("datasets")
+    datasets.Dataset = object
+    trl = ModuleType("trl")
+    trl.SFTConfig = object
+    trl.SFTTrainer = object
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "datasets", datasets)
+    monkeypatch.setitem(sys.modules, "trl", trl)
+
+    if load_error is None:
+        monkeypatch.setattr(
+            "routetune.training._load_quantized_base",
+            lambda _revision: (object(), SimpleNamespace(), MODEL_SHA),
+        )
+    else:
+        monkeypatch.setattr(
+            "routetune.training._load_quantized_base",
+            lambda _revision: (_ for _ in ()).throw(load_error),
+        )
+
+    class SmokeAdapter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def classify(self, _message):
+            if smoke_error is not None:
+                raise smoke_error
+            return smoke
+
+    monkeypatch.setattr("routetune.training.QwenAdapter", SmokeAdapter)
+    monkeypatch.setattr(
+        "routetune.training._evaluate_qwen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TrainingError("reached validation")),
+    )
+    return run
 
 
 class FakeTokenizer:
@@ -133,6 +197,100 @@ def test_adapter_parameter_accounting_requires_only_lora_trainables():
     assert evidence["trainable_parameters"] == 10
     assert evidence["total_parameters"] == 1010
     assert evidence["base_parameters_frozen"] is True
+
+
+@pytest.mark.parametrize(
+    ("raw_output", "predicted_class", "output_valid"),
+    [
+        ("card_arrival", "card_arrival", True),
+        ('no\nThe message is classified as "pending_card_payment" because ...', None, False),
+        ("", None, False),
+    ],
+)
+def test_smoke_execution_is_recorded_independently_of_output_validity(
+    monkeypatch, tmp_path, raw_output, predicted_class, output_valid
+):
+    smoke = GenerationResult(raw_output, predicted_class, output_valid, 0.25, 0.75)
+    run = _mock_phase3_until_smoke(monkeypatch, tmp_path, smoke=smoke)
+
+    with pytest.raises(TrainingError, match="reached validation"):
+        execute_phase3_training(run, tmp_path / "cache")
+
+    manifest = load_manifest(run)
+    assert manifest["state"] == "FAILED"
+    assert manifest["evidence"]["gpu_smoke_verified"] is True
+    assert manifest["evidence"]["gpu_smoke_execution_succeeded"] is True
+    assert manifest["evidence"]["gpu_smoke"] == {
+        "raw_output": raw_output,
+        "predicted_class": predicted_class,
+        "output_valid": output_valid,
+        "tokenization_seconds": 0.25,
+        "generation_seconds": 0.75,
+    }
+
+
+@pytest.mark.parametrize(
+    ("smoke_error", "load_error", "message"),
+    [
+        (RuntimeError("CUDA generation failed"), None, "CUDA generation failed"),
+        (None, RuntimeError("quantized model load failed"), "quantized model load failed"),
+        (None, None, "dataclass instances"),
+    ],
+)
+def test_smoke_generation_and_model_load_failures_still_block(
+    monkeypatch, tmp_path, smoke_error, load_error, message
+):
+    run = _mock_phase3_until_smoke(
+        monkeypatch,
+        tmp_path,
+        smoke_error=smoke_error,
+        load_error=load_error,
+    )
+
+    with pytest.raises(TrainingError, match=message):
+        execute_phase3_training(run, tmp_path / "cache")
+
+    manifest = load_manifest(run)
+    assert manifest["state"] == "FAILED"
+    assert "gpu_smoke_execution_succeeded" not in manifest["evidence"]
+
+
+def test_untuned_validation_keeps_all_invalid_outputs_in_metrics(monkeypatch):
+    records = tuple(
+        Record(
+            f"message {index}",
+            TARGET_LABELS[index % len(TARGET_LABELS)],
+            "official_train",
+        )
+        for index in range(80)
+    )
+    torch = ModuleType("torch")
+    torch.cuda = SimpleNamespace(synchronize=lambda: None)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+    class InvalidAdapter:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def classify(self, message):
+            return GenerationResult(f"no\nExplanation for {message}", None, False, 0.1, 0.2)
+
+    monkeypatch.setattr("routetune.training.QwenAdapter", InvalidAdapter)
+    model = SimpleNamespace(eval=lambda: None)
+    predictions = _evaluate_qwen(object(), model, records, "validation")
+    report = evaluate_predictions(predictions, TARGET_LABELS)
+
+    assert len(predictions) == 80
+    assert predictions[-1].example_id == "validation-079"
+    assert all(row.raw_output.startswith("no\nExplanation") for row in predictions)
+    assert all(
+        row.predicted_class is None and not row.output_valid and not row.correct
+        for row in predictions
+    )
+    assert report.prediction_count == 80
+    assert report.invalid_prediction_count == 80
+    assert report.validity_rate == 0.0
+    assert report.accuracy == 0.0
 
 
 def test_dependency_failure_is_clear_without_touching_gpu(monkeypatch):

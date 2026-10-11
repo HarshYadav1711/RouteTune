@@ -34,6 +34,8 @@ Training examples are rendered with the same `build_messages` prompt used for in
 
 The GPU path resolves one Hugging Face model revision, loads NF4 four-bit weights with nested quantization and FP16 compute, freezes the base through PEFT k-bit preparation, and attaches LoRA only to the seven frozen target-module names. A diagnostic real batch must produce finite loss, non-zero finite LoRA gradients, no frozen-base gradients, and a real optimizer update; the diagnostic adapter snapshot is restored before the two-epoch run.
 
+The untuned smoke generation proves that real GPU inference executed; strict label validity is recorded separately and does not gate training. Its raw completion, parsed label or null, validity, and timing remain evidence, while generation or infrastructure exceptions still block progress.
+
 Each run owns an atomic JSON manifest and moves only through `PREPARED`, `RUNNING`, `TRAINED`, and `VERIFIED`, or into terminal `FAILED`/`INTERRUPTED`. Adapter configuration, weights, tokenizer files, a run identity record, and hashes are checked before reload. Gate E is claimed once and only after all prior evidence is true; a claimed or partial held-out run cannot be silently repeated.
 
 ## Threats to validity
