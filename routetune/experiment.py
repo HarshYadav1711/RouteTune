@@ -33,6 +33,7 @@ REQUIRED_HELDOUT_EVIDENCE = (
     "loss_masks_verified",
     "gpu_smoke_verified",
     "gradient_step_verified",
+    "precision_contract_verified",
     "training_complete",
     "adapter_reloaded",
     "validation_complete",

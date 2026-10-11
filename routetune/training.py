@@ -80,6 +80,7 @@ class QLoRAConfig:
     max_sequence_length: int = 256
     gradient_checkpointing: bool = True
     fp16: bool = True
+    bf16: bool = False
     logging_steps: int = 10
     seed: int = 42
 
@@ -288,6 +289,7 @@ def environment_report() -> dict[str, Any]:
         "cuda_runtime": None,
         "gpu_model": None,
         "gpu_total_vram_bytes": None,
+        "gpu_bf16_supported": None,
     }
     try:
         import torch
@@ -302,6 +304,7 @@ def environment_report() -> dict[str, Any]:
                 gpu_model=properties.name,
                 gpu_total_vram_bytes=properties.total_memory,
                 gpu_compute_capability=list(torch.cuda.get_device_capability(0)),
+                gpu_bf16_supported=bool(torch.cuda.is_bf16_supported()),
             )
     except ImportError:
         pass
@@ -450,6 +453,7 @@ def build_sft_config(config_type: Any, output_dir: Path | str) -> Any:
         "gradient_checkpointing": FIXED_QLORA_CONFIG.gradient_checkpointing,
         "gradient_checkpointing_kwargs": {"use_reentrant": False},
         "fp16": FIXED_QLORA_CONFIG.fp16,
+        "bf16": FIXED_QLORA_CONFIG.bf16,
         "logging_steps": FIXED_QLORA_CONFIG.logging_steps,
         "logging_strategy": "steps",
         "eval_strategy": "epoch",
@@ -639,7 +643,7 @@ def _load_quantized_base(revision: str) -> tuple[Any, Any, str]:
         config=config,
         device_map={"": 0},
         quantization_config=quantization,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
     )
     if not getattr(model, "is_loaded_in_4bit", False):
         raise TrainingError("model did not load with real four-bit quantization")
@@ -647,6 +651,8 @@ def _load_quantized_base(revision: str) -> tuple[Any, Any, str]:
     read = lambda name: actual.get(name) if isinstance(actual, dict) else getattr(actual, name, None)
     if read("bnb_4bit_quant_type") != "nf4" or read("bnb_4bit_use_double_quant") is not True:
         raise TrainingError("loaded quantization is not NF4 with double quantization")
+    if read("bnb_4bit_compute_dtype") != torch.float16:
+        raise TrainingError("loaded quantization compute dtype is not FP16")
     return tokenizer, model, revision
 
 
@@ -655,6 +661,32 @@ def _load_recorded_quantized_base(run_dir: Path) -> tuple[Any, Any, str]:
     if not is_immutable_model_revision(revision):
         raise TrainingError("run manifest does not contain an immutable model revision")
     return _load_quantized_base(revision)
+
+
+def parameter_dtype_histogram(model: Any) -> dict[str, dict[str, dict[str, int]]]:
+    histogram: dict[str, dict[str, dict[str, int]]] = {"trainable": {}, "frozen": {}}
+    for _, parameter in model.named_parameters():
+        group = "trainable" if parameter.requires_grad else "frozen"
+        dtype = str(parameter.dtype).removeprefix("torch.")
+        bucket = histogram[group].setdefault(dtype, {"tensors": 0, "elements": 0})
+        bucket["tensors"] += 1
+        bucket["elements"] += parameter.numel()
+    return histogram
+
+
+def _promote_trainable_adapters_to_fp32(model: Any) -> None:
+    import torch
+
+    trainable = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
+    if not trainable or any("lora_" not in name for name, _ in trainable):
+        raise TrainingError("trainable parameters are not restricted to LoRA adapters")
+    for _, parameter in trainable:
+        if parameter.dtype in (torch.float16, torch.bfloat16):
+            parameter.data = parameter.data.to(torch.float32)
+    if any(parameter.dtype != torch.float32 for _, parameter in trainable):
+        raise TrainingError(
+            f"trainable LoRA parameters must be FP32: {parameter_dtype_histogram(model)['trainable']}"
+        )
 
 
 def _attach_lora(model: Any) -> tuple[Any, dict[str, Any]]:
@@ -671,7 +703,9 @@ def _attach_lora(model: Any) -> tuple[Any, dict[str, Any]]:
             task_type="CAUSAL_LM",
             target_modules=list(FIXED_QLORA_CONFIG.target_modules),
         ),
+        autocast_adapter_dtype=True,
     )
+    _promote_trainable_adapters_to_fp32(model)
     return model, adapter_parameter_evidence(model)
 
 
@@ -700,11 +734,72 @@ def adapter_parameter_evidence(model: Any) -> dict[str, Any]:
     }
 
 
+def verify_training_precision(model: Any, arguments: Any, gradient: dict[str, Any]) -> dict[str, Any]:
+    import torch
+
+    if not torch.cuda.is_available():
+        raise TrainingError("precision gate requires an active CUDA GPU")
+    if arguments.fp16 is not True or arguments.bf16 is not False:
+        raise TrainingError("training precision must use fp16=True and bf16=False")
+    if not getattr(model, "is_loaded_in_4bit", False):
+        raise TrainingError("precision gate requires the four-bit base model")
+    quantization = model.config.quantization_config
+    read = (
+        lambda name: quantization.get(name)
+        if isinstance(quantization, dict)
+        else getattr(quantization, name, None)
+    )
+    if (
+        read("bnb_4bit_quant_type") != "nf4"
+        or read("bnb_4bit_use_double_quant") is not True
+        or read("bnb_4bit_compute_dtype") != torch.float16
+    ):
+        raise TrainingError("precision gate requires NF4 double quantization with FP16 compute")
+
+    parameters = list(model.named_parameters())
+    current_device = torch.cuda.current_device()
+    if any(
+        getattr(parameter.device, "type", None) != "cuda"
+        or getattr(parameter.device, "index", current_device) not in (None, current_device)
+        for _, parameter in parameters
+    ):
+        raise TrainingError("precision gate found a model parameter outside the active CUDA device")
+    adapter = adapter_parameter_evidence(model)
+    trainable = [parameter for _, parameter in parameters if parameter.requires_grad]
+    histogram = parameter_dtype_histogram(model)
+    if any(parameter.dtype != torch.float32 for parameter in trainable):
+        raise TrainingError(f"precision gate found non-FP32 trainable adapters: {histogram['trainable']}")
+    gradient_dtypes = gradient.get("gradient_dtypes")
+    if not isinstance(gradient_dtypes, dict) or not gradient_dtypes:
+        raise TrainingError("precision gate is missing gradient dtype evidence")
+    if set(gradient_dtypes) != {"float32"}:
+        raise TrainingError(f"precision gate found AMP-incompatible gradients: {gradient_dtypes}")
+    return {
+        "cuda_device_index": current_device,
+        "cuda_device_name": torch.cuda.get_device_name(current_device),
+        "bf16_supported": bool(torch.cuda.is_bf16_supported()),
+        "training_fp16": True,
+        "training_bf16": False,
+        "quantization": {
+            "load_in_4bit": True,
+            "quant_type": "nf4",
+            "double_quant": True,
+            "compute_dtype": "float16",
+        },
+        "parameter_dtypes": histogram,
+        "gradient_dtypes": gradient_dtypes,
+        "trainable_parameters": adapter["trainable_parameters"],
+        "base_parameters_frozen": adapter["base_parameters_frozen"],
+    }
+
+
 def _gradient_smoke(model: Any, batch: dict[str, Any]) -> dict[str, Any]:
     import torch
 
     model.train()
     trainable = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
+    if not trainable or any(parameter.dtype != torch.float32 for _, parameter in trainable):
+        raise TrainingError("gradient diagnostic requires FP32 trainable LoRA parameters")
     snapshots = {name: parameter.detach().cpu().clone() for name, parameter in trainable}
     optimizer = torch.optim.AdamW([parameter for _, parameter in trainable], lr=1.5e-4)
     device = next(parameter for _, parameter in trainable).device
@@ -725,6 +820,13 @@ def _gradient_smoke(model: Any, batch: dict[str, Any]) -> dict[str, Any]:
         raise TrainingError("no LoRA parameter received a finite non-zero gradient")
     if any(parameter.grad is not None for _, parameter in model.named_parameters() if not parameter.requires_grad):
         raise TrainingError("a frozen base parameter received a gradient")
+    gradient_dtypes: dict[str, int] = {}
+    for _, parameter in trainable:
+        if parameter.grad is not None:
+            dtype = str(parameter.grad.dtype).removeprefix("torch.")
+            gradient_dtypes[dtype] = gradient_dtypes.get(dtype, 0) + 1
+    if set(gradient_dtypes) != {"float32"}:
+        raise TrainingError(f"gradient diagnostic found AMP-incompatible gradients: {gradient_dtypes}")
     optimizer.step()
     changed = [name for name, parameter in trainable if not torch.equal(parameter.detach().cpu(), snapshots[name])]
     if not changed:
@@ -737,6 +839,7 @@ def _gradient_smoke(model: Any, batch: dict[str, Any]) -> dict[str, Any]:
         "loss": float(loss.detach().cpu()),
         "parameters_with_nonzero_gradients": len(gradient_names),
         "parameters_updated": len(changed),
+        "gradient_dtypes": gradient_dtypes,
         "diagnostic_update_restored": True,
     }
 
@@ -861,6 +964,10 @@ def execute_phase3_training(run_dir: Path, cache_dir: Path) -> Path:
         revision = resolve_model_revision()
         update_run(run_dir, model_revision=revision, evidence={"fingerprints_verified": True})
         tokenizer, base_model, revision = _load_quantized_base(revision)
+        update_run(
+            run_dir,
+            evidence={"loaded_model_dtypes": parameter_dtype_histogram(base_model)},
+        )
         smoke = QwenAdapter(tokenizer, base_model, synchronize=torch.cuda.synchronize).classify(
             "My new card has not arrived yet."
         )
@@ -884,6 +991,13 @@ def execute_phase3_training(run_dir: Path, cache_dir: Path) -> Path:
         validation_rows = tokenize_records(splits.validation, tokenizer)
         collator = CompletionOnlyCollator(tokenizer.pad_token_id)
         model, parameters = _attach_lora(base_model)
+        update_run(
+            run_dir,
+            evidence={
+                "adapter_model_dtypes": parameter_dtype_histogram(model),
+                "parameters": parameters,
+            },
+        )
         diagnostic_batch = collator(train_rows[:2])
         verify_masked_batch(diagnostic_batch)
         gradient = _gradient_smoke(model, diagnostic_batch)
@@ -893,7 +1007,6 @@ def execute_phase3_training(run_dir: Path, cache_dir: Path) -> Path:
                 "loss_masks_verified": True,
                 "gradient_step_verified": True,
                 "gradient_smoke": gradient,
-                "parameters": parameters,
             },
         )
 
@@ -904,6 +1017,11 @@ def execute_phase3_training(run_dir: Path, cache_dir: Path) -> Path:
             eval_dataset=Dataset.from_list(validation_rows),
             data_collator=collator,
             processing_class=tokenizer,
+        )
+        precision = verify_training_precision(model, arguments, gradient)
+        update_run(
+            run_dir,
+            evidence={"precision_contract_verified": True, "precision": precision},
         )
         verify_masked_batch(next(iter(trainer.get_train_dataloader())))
         started = perf_counter()

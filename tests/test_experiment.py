@@ -150,6 +150,7 @@ def test_heldout_gate_requires_all_verified_evidence_and_is_single_use(tmp_path)
         "loss_masks_verified": True,
         "gpu_smoke_verified": True,
         "gradient_step_verified": True,
+        "precision_contract_verified": True,
         "training_complete": True,
         "adapter_reloaded": True,
         "validation_complete": True,
