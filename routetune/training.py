@@ -793,6 +793,64 @@ def verify_training_precision(model: Any, arguments: Any, gradient: dict[str, An
     }
 
 
+def prepare_trainer_precision(
+    trainer: Any, supplied_model: Any, arguments: Any, gradient: dict[str, Any]
+) -> dict[str, Any]:
+    """Restore TRL's quantized-model adapter cast before optimizer creation."""
+
+    model = getattr(trainer, "model", None)
+    if model is not supplied_model:
+        raise TrainingError("SFTTrainer did not retain the supplied model object")
+    if getattr(trainer, "optimizer", None) is not None:
+        raise TrainingError("SFTTrainer created an optimizer before the precision correction")
+
+    before = list(model.named_parameters())
+    identities = [(name, id(parameter), parameter.requires_grad) for name, parameter in before]
+    frozen_dtypes = {
+        name: parameter.dtype for name, parameter in before if not parameter.requires_grad
+    }
+    _promote_trainable_adapters_to_fp32(model)
+    after = list(model.named_parameters())
+    if identities != [(name, id(parameter), parameter.requires_grad) for name, parameter in after]:
+        raise TrainingError("precision correction changed parameter identity or trainability")
+    if frozen_dtypes != {
+        name: parameter.dtype for name, parameter in after if not parameter.requires_grad
+    }:
+        raise TrainingError("precision correction changed a frozen base parameter dtype")
+
+    precision = verify_training_precision(model, arguments, gradient)
+    try:
+        optimizer = trainer.create_optimizer()
+    except Exception as exc:
+        raise TrainingError(
+            f"trainer optimizer creation failed after precision correction: {type(exc).__name__}: {exc}"
+        ) from exc
+    if optimizer is None or getattr(trainer, "optimizer", None) is not optimizer:
+        raise TrainingError("SFTTrainer did not retain the optimizer created after precision correction")
+    trainable_ids = [id(parameter) for _, parameter in after if parameter.requires_grad]
+    optimizer_ids = [
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    if len(optimizer_ids) != len(set(optimizer_ids)) or set(optimizer_ids) != set(trainable_ids):
+        raise TrainingError("trainer optimizer parameters do not match the trainable LoRA adapters")
+    if optimizer.state:
+        raise TrainingError("trainer optimizer unexpectedly has state before training")
+    return {
+        "precision": precision,
+        "pretraining_model_dtypes": parameter_dtype_histogram(model),
+        "trainer_parameter_consistency": {
+            "trainer_model_is_supplied_model": True,
+            "parameter_identity_and_trainability_preserved": True,
+            "frozen_parameter_dtypes_preserved": True,
+            "optimizer_created_after_precision_correction": True,
+            "optimizer_parameter_identity_verified": True,
+            "optimizer_state_empty_before_training": True,
+        },
+    }
+
+
 def _gradient_smoke(model: Any, batch: dict[str, Any]) -> dict[str, Any]:
     import torch
 
@@ -964,9 +1022,15 @@ def execute_phase3_training(run_dir: Path, cache_dir: Path) -> Path:
         revision = resolve_model_revision()
         update_run(run_dir, model_revision=revision, evidence={"fingerprints_verified": True})
         tokenizer, base_model, revision = _load_quantized_base(revision)
+        configured_dtype = getattr(getattr(base_model, "config", None), "dtype", None)
         update_run(
             run_dir,
-            evidence={"loaded_model_dtypes": parameter_dtype_histogram(base_model)},
+            evidence={
+                "loaded_model_dtypes": parameter_dtype_histogram(base_model),
+                "base_model_config_dtype": (
+                    None if configured_dtype is None else str(configured_dtype).removeprefix("torch.")
+                ),
+            },
         )
         smoke = QwenAdapter(tokenizer, base_model, synchronize=torch.cuda.synchronize).classify(
             "My new card has not arrived yet."
@@ -1007,6 +1071,7 @@ def execute_phase3_training(run_dir: Path, cache_dir: Path) -> Path:
                 "loss_masks_verified": True,
                 "gradient_step_verified": True,
                 "gradient_smoke": gradient,
+                "post_gradient_model_dtypes": parameter_dtype_histogram(model),
             },
         )
 
@@ -1018,10 +1083,23 @@ def execute_phase3_training(run_dir: Path, cache_dir: Path) -> Path:
             data_collator=collator,
             processing_class=tokenizer,
         )
-        precision = verify_training_precision(model, arguments, gradient)
+        trainer_model = getattr(trainer, "model", None)
         update_run(
             run_dir,
-            evidence={"precision_contract_verified": True, "precision": precision},
+            evidence={
+                "trainer_initialized_model_dtypes": (
+                    parameter_dtype_histogram(trainer_model) if trainer_model is not None else None
+                ),
+                "trainer_model_is_supplied_model": trainer_model is model,
+                "trainer_optimizer_initialized_before_precision_correction": (
+                    getattr(trainer, "optimizer", None) is not None
+                ),
+            },
+        )
+        trainer_precision = prepare_trainer_precision(trainer, model, arguments, gradient)
+        update_run(
+            run_dir,
+            evidence={"precision_contract_verified": True, **trainer_precision},
         )
         verify_masked_batch(next(iter(trainer.get_train_dataloader())))
         started = perf_counter()

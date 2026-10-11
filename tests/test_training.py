@@ -31,6 +31,7 @@ from routetune.training import (
     execute_phase3_training,
     pad_tokenized_batch,
     parameter_dtype_histogram,
+    prepare_trainer_precision,
     prompt_completion,
     resolve_model_revision,
     tokenize_records,
@@ -493,6 +494,80 @@ def test_precision_gate_rejects_bf16_training_configuration(monkeypatch):
         )
 
 
+class MutatingTrainer:
+    def __init__(self, model):
+        self.model = model
+        self.optimizer = None
+        for _, parameter in model.named_parameters():
+            if parameter.requires_grad:
+                parameter.data = parameter.data.to(BFLOAT16)
+
+    def create_optimizer(self):
+        trainable = [parameter for _, parameter in self.model.named_parameters() if parameter.requires_grad]
+        self.optimizer = SimpleNamespace(param_groups=[{"params": trainable}], state={})
+        return self.optimizer
+
+    def train(self):
+        assert all(
+            parameter.dtype is FLOAT32
+            for _, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        )
+
+
+def test_trainer_precision_repairs_quantized_lora_before_optimizer(monkeypatch):
+    _fake_precision_torch(monkeypatch)
+    model = PrecisionModel()
+    base_parameter = model.parameters[0][1]
+    adapter_parameter = model.parameters[1][1]
+    trainer = MutatingTrainer(model)
+
+    assert parameter_dtype_histogram(trainer.model)["trainable"] == {
+        "bfloat16": {"tensors": 1, "elements": 10}
+    }
+    evidence = prepare_trainer_precision(
+        trainer,
+        model,
+        SimpleNamespace(fp16=True, bf16=False),
+        {"gradient_dtypes": {"float32": 1}},
+    )
+
+    assert trainer.model is model
+    assert model.parameters[0][1] is base_parameter
+    assert base_parameter.dtype is FLOAT16
+    assert base_parameter.requires_grad is False
+    assert model.parameters[1][1] is adapter_parameter
+    assert adapter_parameter.dtype is FLOAT32
+    assert trainer.optimizer.param_groups[0]["params"] == [adapter_parameter]
+    assert evidence["pretraining_model_dtypes"]["trainable"] == {
+        "float32": {"tensors": 1, "elements": 10}
+    }
+    assert all(evidence["trainer_parameter_consistency"].values())
+    trainer.train()
+
+
+def test_trainer_precision_rejects_different_model_or_existing_optimizer(monkeypatch):
+    _fake_precision_torch(monkeypatch)
+    model = PrecisionModel()
+    trainer = MutatingTrainer(model)
+    with pytest.raises(TrainingError, match="retain the supplied model"):
+        prepare_trainer_precision(
+            trainer,
+            PrecisionModel(),
+            SimpleNamespace(fp16=True, bf16=False),
+            {"gradient_dtypes": {"float32": 1}},
+        )
+
+    trainer.optimizer = SimpleNamespace()
+    with pytest.raises(TrainingError, match="optimizer before the precision correction"):
+        prepare_trainer_precision(
+            trainer,
+            model,
+            SimpleNamespace(fp16=True, bf16=False),
+            {"gradient_dtypes": {"float32": 1}},
+        )
+
+
 def test_sft_config_preflight_blocks_model_loading(monkeypatch, tmp_path):
     run = _mock_phase3_until_smoke(monkeypatch, tmp_path)
     model_loaded = False
@@ -544,13 +619,14 @@ def test_precision_gate_failure_marks_running_experiment_failed(monkeypatch, tmp
         lambda *_args: {"gradient_dtypes": {"float32": 1}},
     )
     monkeypatch.setattr(
-        "routetune.training.verify_training_precision",
+        "routetune.training.prepare_trainer_precision",
         lambda *_args: (_ for _ in ()).throw(TrainingError("BF16 adapter detected")),
     )
 
     class Trainer:
-        def __init__(self, **_kwargs):
-            pass
+        def __init__(self, model, **_kwargs):
+            self.model = model
+            self.optimizer = None
 
     class Dataset:
         @staticmethod
@@ -568,6 +644,83 @@ def test_precision_gate_failure_marks_running_experiment_failed(monkeypatch, tmp
     assert manifest["failure"]["message"] == "BF16 adapter detected"
     assert manifest["evidence"]["gradient_step_verified"] is True
     assert "training_complete" not in manifest["evidence"]
+
+
+def test_trainer_dtype_repair_is_recorded_without_weakening_failure_state(monkeypatch, tmp_path):
+    smoke = GenerationResult("card_arrival", "card_arrival", True, 0.1, 0.2)
+    run = _mock_phase3_until_smoke(monkeypatch, tmp_path, smoke=smoke)
+    fingerprints = {"selection": "fixture"}
+    model = PrecisionModel()
+    model.config.dtype = BFLOAT16
+    monkeypatch.setattr("routetune.training.parameter_dtype_histogram", parameter_dtype_histogram)
+    monkeypatch.setattr(
+        "routetune.training.load_locked_splits",
+        lambda *_args, **_kwargs: (SimpleNamespace(train=(), validation=()), fingerprints),
+    )
+    monkeypatch.setattr(
+        "routetune.training._load_quantized_base",
+        lambda _revision: (SimpleNamespace(pad_token_id=0), model, MODEL_SHA),
+    )
+    monkeypatch.setattr("routetune.training._evaluate_qwen", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr("routetune.training._write_evaluation", lambda *_args: None)
+    monkeypatch.setattr("routetune.training.verify_evaluation_artifact", lambda *_args: {})
+    monkeypatch.setattr("routetune.training.tokenize_records", lambda *_args: [{"fixture": True}])
+    monkeypatch.setattr(
+        "routetune.training.CompletionOnlyCollator", lambda _pad: lambda _rows: {"fixture": True}
+    )
+    monkeypatch.setattr(
+        "routetune.training._attach_lora",
+        lambda supplied: (supplied, {"base_parameters_frozen": True}),
+    )
+    monkeypatch.setattr("routetune.training.verify_masked_batch", lambda _batch: None)
+    monkeypatch.setattr(
+        "routetune.training._gradient_smoke",
+        lambda *_args: {"gradient_dtypes": {"float32": 1}},
+    )
+    torch = _fake_precision_torch(monkeypatch)
+    monkeypatch.setattr(
+        "routetune.training.build_sft_config",
+        lambda *_args: SimpleNamespace(fp16=True, bf16=False),
+    )
+    torch.manual_seed = lambda _seed: None
+    torch.cuda.manual_seed_all = lambda _seed: None
+    torch.cuda.synchronize = lambda: None
+
+    class Trainer(MutatingTrainer):
+        def __init__(self, model, **_kwargs):
+            super().__init__(model)
+
+        def get_train_dataloader(self):
+            raise TrainingError("stop after precision evidence")
+
+    class Dataset:
+        @staticmethod
+        def from_list(rows):
+            return rows
+
+    sys.modules["datasets"].Dataset = Dataset
+    sys.modules["trl"].SFTTrainer = Trainer
+
+    with pytest.raises(TrainingError, match="stop after precision evidence"):
+        execute_phase3_training(run, tmp_path / "cache")
+
+    manifest = load_manifest(run)
+    evidence = manifest["evidence"]
+    assert manifest["state"] == "FAILED"
+    assert evidence["base_model_config_dtype"] == "bfloat16"
+    assert evidence["adapter_model_dtypes"]["trainable"] == {
+        "float32": {"tensors": 1, "elements": 10}
+    }
+    assert evidence["post_gradient_model_dtypes"] == evidence["adapter_model_dtypes"]
+    assert evidence["trainer_initialized_model_dtypes"]["trainable"] == {
+        "bfloat16": {"tensors": 1, "elements": 10}
+    }
+    assert evidence["pretraining_model_dtypes"]["trainable"] == {
+        "float32": {"tensors": 1, "elements": 10}
+    }
+    assert evidence["precision_contract_verified"] is True
+    assert all(evidence["trainer_parameter_consistency"].values())
+    assert "training_complete" not in evidence
 
 
 @pytest.mark.parametrize(
