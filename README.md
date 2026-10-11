@@ -4,7 +4,7 @@ RouteTune is an evidence-first experiment that will test whether QLoRA adaptatio
 
 ## Current status
 
-Phases 1 and 2 are **VERIFIED** on the available Python 3.13.3 environment. The project now has validated data ingestion, deterministic splits, a shared strict evaluator, a real TF-IDF/logistic-regression validation baseline, an injected and CPU-tested Qwen inference contract, and a frozen 20-case robustness suite. QLoRA training, adapter loading, official held-out model evaluation, and production infrastructure are **NOT IMPLEMENTED**. Real quantized Qwen execution is **NOT VERIFIED**.
+Phases 1 and 2 are **VERIFIED**. Phase 3 is **PREPARED / GPU EXECUTION BLOCKED**: its CPU contract, evidence ledger, genuine QLoRA path, and Colab notebook are implemented and 63 offline tests pass, but no real GPU training or held-out evaluation has been run. The local environment lacks the optional GPU packages and its 4 GiB GTX 1650 Ti is below the fixed-run 12 GiB gate. Phase 4 has not started.
 
 ## Structure
 
@@ -14,7 +14,10 @@ Phases 1 and 2 are **VERIFIED** on the available Python 3.13.3 environment. The 
 - `routetune/baseline.py`: validation-only TF-IDF/logistic-regression runner and JSON artifacts
 - `routetune/inference.py`: chat-template and completion-only Qwen adapter
 - `routetune/challenge.py`: frozen handcrafted diagnostic cases
+- `routetune/training.py`: masked QLoRA data, GPU gates, training, reload, and controlled evaluation
+- `routetune/experiment.py`: atomic run manifests, artifact identity, and held-out gate
 - `routetune/cli.py`: cohesive Phase 2 commands
+- `notebooks/RouteTune_Colab.ipynb`: T4-or-better Phase 3 execution and artifact export
 - `tests/`: synthetic CPU tests plus a cache-backed, network-free integration check
 - `docs/EXPERIMENT_PROTOCOL.md`: scientific contract for all phases
 - `docs/PHASES.md`: phase gates and evidence-backed status
@@ -65,7 +68,19 @@ Each baseline output directory must be new; artifacts are never overwritten.
 
 The verified baseline fitted 360 training examples and evaluated 80 validation examples with scikit-learn 1.9.1. It produced accuracy `0.8875`, macro F1 `0.8868696362117415`, 71 correct predictions, and 100% vocabulary-valid output. This is a validation result, not an official held-out test result. The complete 80-record artifact is at `artifacts/phase2/tfidf-validation-20261011-final/result.json` and is intentionally ignored by Git.
 
-The local environment resolved NumPy 2.5.4 and SciPy 1.18.1. Optional Qwen packages are separated behind `.[qwen]`; that extra was not installed or verified during Phase 2. The visible GTX 1650 Ti and driver alone do not establish that the exact 4-bit stack works.
+The local environment resolved NumPy 2.5.4 and SciPy 1.18.1. Optional GPU packages are isolated behind `.[gpu]`; they are deliberately absent from the Windows CPU environment. A visible GPU and driver alone do not establish that the exact four-bit stack works.
+
+## Phase 3 Colab handoff
+
+1. Create a ZIP of the current project worktree without `.venv`, `data`, or `artifacts`.
+2. Open `notebooks/RouteTune_Colab.ipynb` in Google Colab and select a T4-or-better GPU runtime.
+3. Run each cell in order, upload that ZIP, permit the Google Drive mount, and retain the printed run path.
+4. The notebook installs the exact `.[gpu,test]` lock, checks installed APIs and CUDA, runs all CPU tests, downloads and fingerprints BANKING77, creates a fresh `PREPARED` run, then executes Gates B-D.
+5. Return the exported run ZIP. Do not enable `RUN_FINAL_HELDOUT` until the manifest is `VERIFIED` and the Gate B-D evidence has been reviewed.
+
+The current lock is `torch 2.14.1`, `transformers 5.19.0`, `trl 1.15.0`, `peft 0.21.2`, `accelerate 1.15.0`, `bitsandbytes 0.50.2`, and `datasets 4.7.0`. These are a reproducible target, not locally verified GPU evidence; the notebook checks the required installed APIs before model loading.
+
+QLoRA keeps the quantized base weights frozen and trains small LoRA matrices, unlike full fine-tuning. NF4 represents normally distributed pretrained weights efficiently, while double quantization reduces quantization-metadata cost. Gradient accumulation produces an effective batch of 16 from four-example device batches, and checkpointing trades extra recomputation for lower activation memory. Completion-only labels mask prompts and padding with `-100`, so only the exact assistant label/control suffix contributes to loss. Lower loss is not classification accuracy: generated labels are separately parsed and scored. Saving is insufficient by itself, so adapter identity, hashes, reload, and deterministic reload outputs are verified before validation or held-out authorization. Test contamination can still occur without fitting on test rows if prompts, settings, or rerun decisions are changed after seeing held-out results; the ledger therefore makes Gate E single-use.
 
 ## Data attribution
 

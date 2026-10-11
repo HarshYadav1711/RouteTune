@@ -22,9 +22,11 @@ The 20-case challenge fingerprint is `85ebd0e590b90c352370bb4d4772a3f886c4e4055e
 
 ## 3. QLoRA Training and Controlled GPU Experiment
 
-Status: **NOT IMPLEMENTED**.
+Status: **IMPLEMENTED, UNVERIFIED / GPU EXECUTION BLOCKED** on 2026-10-11.
 
 Gate: fixed training contract executes on real compatible hardware; isolated run state and artifacts prove success or failure; adapter identity and configuration are verified.
+
+Evidence: the CPU-verifiable implementation and Colab handoff are prepared. The offline suite reports 63 passing tests, including explicit completion-loss masks, frozen settings, run-state transitions, interrupted/failed runs, stale adapter rejection, metric recomputation, and held-out gating. The local Python environment has no PyTorch/Transformers/TRL/PEFT/bitsandbytes stack, and the visible GTX 1650 Ti has 4 GiB rather than the workflow's 12 GiB fixed-run minimum. Gates B-D therefore have no real GPU evidence, no adapter exists, and the one-time Gate E has not been claimed. Run `notebooks/RouteTune_Colab.ipynb` on a T4-or-better runtime and return the exported run ZIP before this status can advance.
 
 ## 4. Model Diagnostics and Portfolio Release
 

@@ -10,11 +10,11 @@ For example, `" Card   LOST "` and `"card lost"` normalize to the same key. If o
 
 Sampling derives a SHA-256 seed from the global seed and each source/label namespace, then ranks candidates deterministically. A fixed seed matters because changing examples can change measured performance; without control, a code change and a sample change cannot be separated. Source SHA-256 fingerprints make exact input bytes identifiable and changes detectable, but do not prove upstream trust.
 
-## Future model experiment (not implemented)
+## Phase 3 model experiment (prepared; GPU verification pending)
 
 The fixed base model is `Qwen/Qwen2.5-0.5B-Instruct`. Phase 3 will use NF4 4-bit quantization with double quantization; LoRA rank 8, alpha 16, dropout 0.05; targets `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, and `down_proj`; two epochs; learning rate `1.5e-4`; gradient accumulation 4; maximum sequence length 256; and completion-only supervised training.
 
-Future comparisons must use the same examples and documented conditions:
+The prepared comparison uses the same examples and documented conditions:
 
 1. TF-IDF plus logistic regression (feature-based prediction)
 2. Untuned 4-bit Qwen (generative inference)
@@ -26,7 +26,15 @@ Latency reporting must disclose those methodological differences. Generated labe
 
 Development validation may guide prompts and hyperparameters. Held-out test results may be produced only for independent evaluation and must not guide fixes: doing so converts test data into development data and makes the final estimate optimistic. A separate frozen robustness challenge suite will support qualitative diagnostics and must not become a repeatedly optimized target.
 
-Later phases plan accuracy, macro/micro/weighted precision, recall and F1, per-class precision/recall/F1 and confusion matrices, invalid-output rate for generative models, and clearly conditioned latency. Balanced classes make accuracy easier to interpret, but do not reveal whether one intent systematically fails; per-class results and confusion pairs remain necessary.
+The shared evaluator records accuracy, macro precision/recall/F1, per-class precision/recall/F1, confusion matrices, invalid-output rate, and clearly conditioned latency. Balanced classes make accuracy easier to interpret, but do not reveal whether one intent systematically fails; per-class results and confusion pairs remain necessary.
+
+## Phase 3 execution controls
+
+Training examples are rendered with the same `build_messages` prompt used for inference. The tokenizer first renders that prompt with an assistant-generation prefix, then renders the same messages plus the exact target label. Prompt positions receive label `-100`; completion control/label tokens remain supervised; right-padding also receives `-100`. Any non-prefix template result, empty target, malformed decoded completion, or sequence over 256 tokens fails before training rather than truncating a target.
+
+The GPU path resolves one Hugging Face model revision, loads NF4 four-bit weights with nested quantization and FP16 compute, freezes the base through PEFT k-bit preparation, and attaches LoRA only to the seven frozen target-module names. A diagnostic real batch must produce finite loss, non-zero finite LoRA gradients, no frozen-base gradients, and a real optimizer update; the diagnostic adapter snapshot is restored before the two-epoch run.
+
+Each run owns an atomic JSON manifest and moves only through `PREPARED`, `RUNNING`, `TRAINED`, and `VERIFIED`, or into terminal `FAILED`/`INTERRUPTED`. Adapter configuration, weights, tokenizer files, a run identity record, and hashes are checked before reload. Gate E is claimed once and only after all prior evidence is true; a claimed or partial held-out run cannot be silently repeated.
 
 ## Threats to validity
 

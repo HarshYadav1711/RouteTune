@@ -70,12 +70,23 @@ def predict_validation(
     validation_records: tuple[Record, ...],
     labels: tuple[str, ...],
 ) -> tuple[PredictionRecord, ...]:
+    return predict_records(pipeline, validation_records, labels, "validation")
+
+
+def predict_records(
+    pipeline: Pipeline,
+    records: tuple[Record, ...],
+    labels: tuple[str, ...],
+    split_name: str,
+) -> tuple[PredictionRecord, ...]:
+    if not split_name or any(character.isspace() for character in split_name):
+        raise BaselineError("split name must be a non-empty token")
     predictions: list[PredictionRecord] = []
-    for index, record in enumerate(validation_records):
+    for index, record in enumerate(records):
         output, elapsed = timed_call(lambda: str(pipeline.predict([record.text])[0]))
         predictions.append(
             prediction_record(
-                example_id=f"validation-{index:03d}",
+                example_id=f"{split_name}-{index:03d}",
                 input_message=record.text,
                 expected_class=record.category,
                 raw_output=output,
